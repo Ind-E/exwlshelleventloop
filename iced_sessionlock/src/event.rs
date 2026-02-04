@@ -1,4 +1,4 @@
-use iced::mouse;
+use iced_core::mouse;
 use sessionlockev::DispatchMessage;
 use sessionlockev::keyboard::ModifiersState;
 use sessionlockev::reexport::wayland_client::{ButtonState, KeyState, WEnum};
@@ -94,7 +94,8 @@ pub enum WindowEvent {
         y: f64,
     },
     Refresh,
-    ThemeChanged(iced::theme::Mode),
+    Closed,
+    ThemeChanged(iced_core::theme::Mode),
 }
 
 #[derive(Debug)]
@@ -108,6 +109,7 @@ impl From<&DispatchMessage> for WindowEvent {
     fn from(value: &DispatchMessage) -> Self {
         match value {
             DispatchMessage::RequestRefresh { .. } => WindowEvent::Refresh,
+            DispatchMessage::Closed => WindowEvent::Closed,
             DispatchMessage::MouseEnter {
                 surface_x: x,
                 surface_y: y,

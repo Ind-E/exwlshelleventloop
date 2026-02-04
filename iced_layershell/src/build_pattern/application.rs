@@ -1,7 +1,10 @@
+mod time;
+
 use std::borrow::Cow;
 
-use iced::Font;
-use iced::{Element, Task};
+use iced_core::Element;
+use iced_core::Font;
+use iced_runtime::Task;
 
 use crate::actions::LayershellCustomActionWithId;
 
@@ -13,6 +16,8 @@ use crate::settings::Settings;
 
 use iced_debug as debug;
 use iced_program::Program;
+
+pub use time::timed;
 
 pub trait NameSpace {
     /// Produces the namespace of the [`SingleApplication`].
@@ -38,16 +43,16 @@ where
 ///
 /// This trait allows the [`application`] builder to take any closure that
 /// returns any `Into<Task<Message>>`.
-pub trait Update<State, Message> {
+pub trait UpdateFn<State, Message> {
     /// Processes the message and updates the state of the [`SingleApplication`].
     fn update(&self, state: &mut State, message: Message) -> impl Into<Task<Message>>;
 }
 
-impl<State, Message> Update<State, Message> for () {
+impl<State, Message> UpdateFn<State, Message> for () {
     fn update(&self, _state: &mut State, _message: Message) -> impl Into<Task<Message>> {}
 }
 
-impl<T, State, Message, C> Update<State, Message> for T
+impl<T, State, Message, C> UpdateFn<State, Message> for T
 where
     T: Fn(&mut State, Message) -> C,
     C: Into<Task<Message>>,
@@ -61,28 +66,29 @@ where
 ///
 /// This trait allows the [`application`] builder to take any closure that
 /// returns any `Into<Element<'_, Message>>`.
-pub trait View<'a, State, Message, Theme, Renderer> {
+pub trait ViewFn<'a, State, Message, Theme, Renderer> {
     /// Produces the widget of the [`Application`].
-    fn view(&self, state: &'a State) -> impl Into<Element<'a, Message, Theme, Renderer>>;
+    fn view(&self, state: &'a State) -> Element<'a, Message, Theme, Renderer>;
 }
 
-impl<'a, T, State, Message, Theme, Renderer, Widget> View<'a, State, Message, Theme, Renderer> for T
+impl<'a, T, State, Message, Theme, Renderer, Widget> ViewFn<'a, State, Message, Theme, Renderer>
+    for T
 where
     T: Fn(&'a State) -> Widget,
     State: 'static,
     Widget: Into<Element<'a, Message, Theme, Renderer>>,
 {
-    fn view(&self, state: &'a State) -> impl Into<Element<'a, Message, Theme, Renderer>> {
-        self(state)
+    fn view(&self, state: &'a State) -> Element<'a, Message, Theme, Renderer> {
+        self(state).into()
     }
 }
 
-pub trait Boot<State, Message> {
+pub trait BootFn<State, Message> {
     /// Initializes the [`SingleApplication`] state.
     fn boot(&self) -> (State, Task<Message>);
 }
 
-impl<T, C, State, Message> Boot<State, Message> for T
+impl<T, C, State, Message> BootFn<State, Message> for T
 where
     T: Fn() -> C,
     C: IntoBoot<State, Message>,
@@ -126,8 +132,8 @@ pub trait ThemeFn<State, Theme> {
     fn theme(&self, state: &State) -> Option<Theme>;
 }
 
-impl<State> ThemeFn<State, iced::Theme> for iced::Theme {
-    fn theme(&self, _state: &State) -> Option<iced::Theme> {
+impl<State> ThemeFn<State, iced_core::Theme> for iced_core::Theme {
+    fn theme(&self, _state: &State) -> Option<iced_core::Theme> {
         Some(self.clone())
     }
 }
@@ -150,10 +156,10 @@ pub struct SingleApplication<A: Program> {
 }
 
 pub fn application<State, Message, Theme, Renderer>(
-    boot: impl Boot<State, Message>,
+    boot: impl BootFn<State, Message>,
     namespace: impl NameSpace,
-    update: impl Update<State, Message>,
-    view: impl for<'a> self::View<'a, State, Message, Theme, Renderer>,
+    update: impl UpdateFn<State, Message>,
+    view: impl for<'a> self::ViewFn<'a, State, Message, Theme, Renderer>,
 ) -> SingleApplication<impl Program<Message = Message, Theme = Theme, State = State>>
 where
     State: 'static,
@@ -163,24 +169,24 @@ where
     Renderer: iced_program::Renderer,
 {
     use std::marker::PhantomData;
-    struct Instance<State, Message, Theme, Renderer, Update, View, Boot> {
-        update: Update,
-        view: View,
-        boot: Boot,
+    struct Instance<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn> {
+        update: UpdateFn,
+        view: ViewFn,
+        boot: BootFn,
         _state: PhantomData<State>,
         _message: PhantomData<Message>,
         _theme: PhantomData<Theme>,
         _renderer: PhantomData<Renderer>,
     }
-    impl<State, Message, Theme, Renderer, Update, View, Boot> Program
-        for Instance<State, Message, Theme, Renderer, Update, View, Boot>
+    impl<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn> Program
+        for Instance<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn>
     where
         Message: 'static + TryInto<LayershellCustomActionWithId, Error = Message> + Send,
         Theme: DefaultStyle,
         Renderer: iced_program::Renderer,
-        Update: self::Update<State, Message>,
-        Boot: self::Boot<State, Message>,
-        View: for<'a> self::View<'a, State, Message, Theme, Renderer>,
+        UpdateFn: self::UpdateFn<State, Message>,
+        BootFn: self::BootFn<State, Message>,
+        ViewFn: for<'a> self::ViewFn<'a, State, Message, Theme, Renderer>,
     {
         type State = State;
         type Renderer = Renderer;
@@ -203,12 +209,12 @@ where
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            _window: iced::window::Id,
+            _window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
-            debug::hot(|| self.view.view(state)).into()
+            debug::hot(|| self.view.view(state))
         }
 
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -265,16 +271,16 @@ pub fn with_executor<P: Program, E: iced_futures::Executor>(
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            window: iced::window::Id,
+            window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
             self.program.view(state, window)
         }
 
-        fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+        fn subscription(&self, state: &Self::State) -> iced_futures::Subscription<Self::Message> {
             self.program.subscription(state)
         }
 
-        fn theme(&self, state: &Self::State, window: iced::window::Id) -> Option<Self::Theme> {
+        fn theme(&self, state: &Self::State, window: iced_core::window::Id) -> Option<Self::Theme> {
             self.program.theme(state, window)
         }
 
@@ -282,10 +288,10 @@ pub fn with_executor<P: Program, E: iced_futures::Executor>(
             self.program.style(state, theme)
         }
 
-        fn scale_factor(&self, state: &Self::State, id: iced::window::Id) -> f32 {
+        fn scale_factor(&self, state: &Self::State, id: iced_core::window::Id) -> f32 {
             self.program.scale_factor(state, id)
         }
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -302,7 +308,7 @@ pub fn with_executor<P: Program, E: iced_futures::Executor>(
 
 pub fn with_subscription<P: Program>(
     program: P,
-    f: impl Fn(&P::State) -> iced::Subscription<P::Message>,
+    f: impl Fn(&P::State) -> iced_futures::Subscription<P::Message>,
 ) -> impl Program<State = P::State, Message = P::Message, Theme = P::Theme> {
     struct WithSubscription<P, F> {
         program: P,
@@ -311,7 +317,7 @@ pub fn with_subscription<P: Program>(
 
     impl<P: Program, F> Program for WithSubscription<P, F>
     where
-        F: Fn(&P::State) -> iced::Subscription<P::Message>,
+        F: Fn(&P::State) -> iced_futures::Subscription<P::Message>,
     {
         type State = P::State;
         type Message = P::Message;
@@ -319,7 +325,7 @@ pub fn with_subscription<P: Program>(
         type Renderer = P::Renderer;
         type Executor = P::Executor;
 
-        fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+        fn subscription(&self, state: &Self::State) -> iced_futures::Subscription<Self::Message> {
             (self.subscription)(state)
         }
         fn boot(&self) -> (Self::State, Task<Self::Message>) {
@@ -336,12 +342,12 @@ pub fn with_subscription<P: Program>(
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            window: iced::window::Id,
+            window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
             self.program.view(state, window)
         }
 
-        fn theme(&self, state: &Self::State, window: iced::window::Id) -> Option<Self::Theme> {
+        fn theme(&self, state: &Self::State, window: iced_core::window::Id) -> Option<Self::Theme> {
             self.program.theme(state, window)
         }
 
@@ -349,10 +355,10 @@ pub fn with_subscription<P: Program>(
             self.program.style(state, theme)
         }
 
-        fn scale_factor(&self, state: &Self::State, id: iced::window::Id) -> f32 {
+        fn scale_factor(&self, state: &Self::State, id: iced_core::window::Id) -> f32 {
             self.program.scale_factor(state, id)
         }
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -386,7 +392,11 @@ pub fn with_theme<P: Program>(
         type Renderer = P::Renderer;
         type Executor = P::Executor;
 
-        fn theme(&self, state: &Self::State, _window: iced::window::Id) -> Option<Self::Theme> {
+        fn theme(
+            &self,
+            state: &Self::State,
+            _window: iced_core::window::Id,
+        ) -> Option<Self::Theme> {
             (self.theme)(state)
         }
 
@@ -404,12 +414,12 @@ pub fn with_theme<P: Program>(
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            window: iced::window::Id,
+            window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
             self.program.view(state, window)
         }
 
-        fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+        fn subscription(&self, state: &Self::State) -> iced_futures::Subscription<Self::Message> {
             self.program.subscription(state)
         }
 
@@ -417,10 +427,10 @@ pub fn with_theme<P: Program>(
             self.program.style(state, theme)
         }
 
-        fn scale_factor(&self, state: &Self::State, id: iced::window::Id) -> f32 {
+        fn scale_factor(&self, state: &Self::State, id: iced_core::window::Id) -> f32 {
             self.program.scale_factor(state, id)
         }
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -469,23 +479,23 @@ pub fn with_style<P: Program>(
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            window: iced::window::Id,
+            window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
             self.program.view(state, window)
         }
 
-        fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+        fn subscription(&self, state: &Self::State) -> iced_futures::Subscription<Self::Message> {
             self.program.subscription(state)
         }
 
-        fn theme(&self, state: &Self::State, window: iced::window::Id) -> Option<Self::Theme> {
+        fn theme(&self, state: &Self::State, window: iced_core::window::Id) -> Option<Self::Theme> {
             self.program.theme(state, window)
         }
 
-        fn scale_factor(&self, state: &Self::State, id: iced::window::Id) -> f32 {
+        fn scale_factor(&self, state: &Self::State, id: iced_core::window::Id) -> f32 {
             self.program.scale_factor(state, id)
         }
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -527,16 +537,16 @@ pub fn with_scale_factor<P: Program>(
         fn view<'a>(
             &self,
             state: &'a Self::State,
-            window: iced::window::Id,
+            window: iced_core::window::Id,
         ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
             self.program.view(state, window)
         }
 
-        fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+        fn subscription(&self, state: &Self::State) -> iced_futures::Subscription<Self::Message> {
             self.program.subscription(state)
         }
 
-        fn theme(&self, state: &Self::State, window: iced::window::Id) -> Option<Self::Theme> {
+        fn theme(&self, state: &Self::State, window: iced_core::window::Id) -> Option<Self::Theme> {
             self.program.theme(state, window)
         }
 
@@ -544,13 +554,13 @@ pub fn with_scale_factor<P: Program>(
             self.program.style(state, theme)
         }
 
-        fn scale_factor(&self, state: &Self::State, _id: iced::window::Id) -> f32 {
+        fn scale_factor(&self, state: &Self::State, _id: iced_core::window::Id) -> f32 {
             (self.scale_factor)(state)
         }
         fn boot(&self) -> (Self::State, Task<Self::Message>) {
             self.program.boot()
         }
-        fn settings(&self) -> iced::Settings {
+        fn settings(&self) -> iced_core::Settings {
             Default::default()
         }
 
@@ -653,10 +663,13 @@ impl<P: Program> SingleApplication<P> {
     }
 
     /// set the default_text_size
-    pub fn default_text_size(self, default_text_size: iced::Pixels) -> Self {
+    pub fn default_text_size<Pixels: Into<iced_core::Pixels>>(
+        self,
+        default_text_size: Pixels,
+    ) -> Self {
         Self {
             settings: Settings {
-                default_text_size,
+                default_text_size: default_text_size.into(),
                 ..self.settings
             },
             ..self
@@ -677,7 +690,7 @@ impl<P: Program> SingleApplication<P> {
     /// Sets the subscription logic of the [`SingleApplication`].
     pub fn subscription(
         self,
-        f: impl Fn(&P::State) -> iced::Subscription<P::Message>,
+        f: impl Fn(&P::State) -> iced_futures::Subscription<P::Message>,
     ) -> SingleApplication<impl Program<State = P::State, Message = P::Message, Theme = P::Theme>>
     {
         SingleApplication {

@@ -6,7 +6,7 @@ members = [
   "iced_layershell_macros",
   "iced_sessionlock",
   "iced_sessionlock_macros",
-  "starcolorkeyboard",
+  "iced_wayland_subscriber",
   "sessionlockev",
   "waycrate_xkbkeycode",
   "iced_exdevtools",
@@ -19,7 +19,7 @@ authors = [
   "Aakash Sen Sharma <aakashsensharma@gmail.com>",
 ]
 edition = "2024"
-version = "0.14.0-dev"
+version = "0.15.0-rc1"
 license = "MIT"
 repository = "https://github.com/waycrate/exwlshelleventloop"
 description = "Wayland extra shell lib"
@@ -27,17 +27,17 @@ keywords = ["wayland", "wlroots"]
 readme = "README.md"
 
 [workspace.dependencies]
-layershellev = { version = "0.14.0-dev", path = "./layershellev" }
-sessionlockev = { version = "0.14.0-dev", path = "./sessionlockev" }
+layershellev = { version = "0.15.0-rc1", path = "./layershellev" }
+sessionlockev = { version = "0.15.0-rc1", path = "./sessionlockev" }
+iced_wayland_subscriber = { version = "0.15.0-rc1", path = "./iced_wayland_subscriber" }
+iced_layershell = { version = "0.15.0-rc1", path = "./iced_layershell" }
+iced_exdevtools = { version = "0.15.0-rc1", path = "./iced_exdevtools" }
+iced_layershell_macros = { version = "0.15.0-rc1", path = "./iced_layershell_macros" }
+iced_sessionlock = { version = "0.15.0-rc1", path = "./iced_sessionlock" }
+iced_sessionlock_macros = { version = "0.15.0-rc1", path = "./iced_sessionlock_macros" }
+waycrate_xkbkeycode = { version = "0.15.0-rc1", path = "./waycrate_xkbkeycode" }
 
-iced_layershell = { version = "0.14.0-dev", path = "./iced_layershell" }
-iced_exdevtools = { version = "0.14.0-dev", path = "./iced_exdevtools" }
-iced_layershell_macros = { version = "0.14.0-dev", path = "./iced_layershell_macros" }
-iced_sessionlock = { version = "0.14.0-dev", path = "./iced_sessionlock" }
-iced_sessionlock_macros = { version = "0.14.0-dev", path = "./iced_sessionlock_macros" }
-waycrate_xkbkeycode = { version = "0.14.0-dev", path = "./waycrate_xkbkeycode" }
-
-tempfile = "3.23.0"
+tempfile = "3.24.0"
 thiserror = "2.0.12"
 wayland-client = { version = "0.31.7" }
 
@@ -47,7 +47,6 @@ wayland-protocols = { version = "0.32.5", default-features = false, features = [
   "client",
 ] }
 
-mundy = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["std", "env-filter"] }
 
 wayland-cursor = "0.31.7"
@@ -59,10 +58,6 @@ wayland-protocols-wlr = { version = "0.3.5", default-features = false, features 
 wayland-protocols-misc = { version = "0.3.5", features = ["client"] }
 wayland-backend = { version = "0.3.7", features = ["client_system"] }
 
-#sctk = { package = "smithay-client-toolkit", version = "0.19.2", features = [
-#  "calloop",
-#] }
-
 calloop = "0.14.1"
 calloop-wayland-source = "0.4.0"
 
@@ -71,18 +66,17 @@ rwh_05 = { package = "raw-window-handle", version = "0.5.2", features = [
 ] }
 rwh_06 = { package = "raw-window-handle", version = "0.6", features = ["std"] }
 
-iced = { git = "https://github.com/iced-rs/iced.git", default-features = false }
-iced_runtime = { git = "https://github.com/iced-rs/iced.git" }
-#iced_style = "0.13"
-iced_core = { git = "https://github.com/iced-rs/iced.git" }
-iced_program = { git = "https://github.com/iced-rs/iced.git" }
-iced_renderer = { git = "https://github.com/iced-rs/iced.git" }
-iced_futures = { git = "https://github.com/iced-rs/iced.git" }
-iced_graphics = { git = "https://github.com/iced-rs/iced.git" }
-iced_debug = { git = "https://github.com/iced-rs/iced.git" }
-iced_devtools = { git = "https://github.com/iced-rs/iced.git" }
-iced_widget = { git = "https://github.com/iced-rs/iced.git" }
-window_clipboard = "0.4.1"
+iced = "0.14"
+iced_runtime = "0.14"
+iced_core = "0.14"
+iced_program = "0.14"
+iced_renderer = "0.14"
+iced_futures = "0.14"
+iced_graphics = "0.14"
+iced_debug = "0.14"
+iced_devtools = "0.14"
+iced_widget = "0.14"
+window_clipboard = "0.5.0"
 
 bitflags = "2.9.0"
 log = "0.4.22"

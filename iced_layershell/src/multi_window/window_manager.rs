@@ -9,8 +9,8 @@ use iced_core::input_method;
 use iced_graphics::Compositor;
 use layershellev::{WindowWrapper, id::Id as LayerId};
 
-use iced::mouse;
-use iced::window::Id as IcedId;
+use iced_core::mouse;
+use iced_core::window::Id as IcedId;
 use iced_program::Instance;
 use iced_program::Program;
 
@@ -28,7 +28,7 @@ where
     pub state: State<P>,
     pub mouse_interaction: mouse::Interaction,
     preedit: Option<Preedit<P::Renderer>>,
-    ime_state: Option<(iced_core::Point, input_method::Purpose)>,
+    ime_state: Option<(iced_core::Rectangle, input_method::Purpose)>,
 }
 
 pub struct WindowManager<P: Program, C: Compositor>
@@ -92,7 +92,7 @@ where
         window: Arc<WindowWrapper>,
         application: &Instance<P>,
         compositor: &mut C,
-        system_theme: iced::theme::Mode,
+        system_theme: iced_core::theme::Mode,
     ) -> &mut Window<P, C> {
         let layerid = window.id();
         let state = State::new(id, application, size, fractal_scale, &window, system_theme);
@@ -166,18 +166,18 @@ where
         match input_method {
             InputMethod::Disabled => self.disable_ime(),
             InputMethod::Enabled {
-                position,
                 purpose,
                 preedit,
+                cursor,
             } => {
                 let mut flags = ImeState::empty();
                 if self.ime_state.is_none() {
                     flags.insert(ImeState::Allowed);
                 }
-                if self.ime_state != Some((position, purpose)) {
+                if self.ime_state != Some((cursor, purpose)) {
                     flags.insert(ImeState::Update);
                 }
-                self.update_ime(position, purpose);
+                self.update_ime(cursor, purpose);
 
                 if let Some(preedit) = preedit {
                     if preedit.content.is_empty() {
@@ -186,7 +186,7 @@ where
                         let mut overlay = self.preedit.take().unwrap_or_else(Preedit::new);
 
                         overlay.update(
-                            position,
+                            cursor,
                             &preedit,
                             self.state.background_color(),
                             &self.renderer,
@@ -216,9 +216,9 @@ where
         }
     }
 
-    fn update_ime(&mut self, position: iced_core::Point, purpose: input_method::Purpose) {
-        if self.ime_state != Some((position, purpose)) {
-            self.ime_state = Some((position, purpose));
+    fn update_ime(&mut self, cursor: iced_core::Rectangle, purpose: input_method::Purpose) {
+        if self.ime_state != Some((cursor, purpose)) {
+            self.ime_state = Some((cursor, purpose));
         }
     }
 

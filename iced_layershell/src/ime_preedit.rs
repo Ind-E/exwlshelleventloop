@@ -36,13 +36,12 @@ where
 
     pub fn update(
         &mut self,
-        position: Point,
+        cursor: Rectangle,
         preedit: &input_method::Preedit,
         background: Color,
         renderer: &Renderer,
     ) {
-        self.position = position;
-
+        self.position = cursor.position() + Vector::new(0.0, cursor.height);
         let spans = match &preedit.selection {
             Some(selection) => {
                 vec![

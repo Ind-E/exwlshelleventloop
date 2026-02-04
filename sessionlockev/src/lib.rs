@@ -97,8 +97,10 @@
 
 mod events;
 
+use calloop::RegistrationToken;
 pub use waycrate_xkbkeycode::keyboard;
 pub use waycrate_xkbkeycode::xkb_keyboard;
+use waycrate_xkbkeycode::xkb_keyboard::ElementState;
 use waycrate_xkbkeycode::xkb_keyboard::RepeatInfo;
 
 mod strtoshape;
@@ -157,10 +159,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 };
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+
 use std::time::Duration;
 use std::time::Instant;
 
@@ -168,6 +167,7 @@ pub use calloop;
 
 use calloop::{
     Error as CallLoopError, EventLoop, LoopHandle,
+    channel::{self, Channel},
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
@@ -176,7 +176,7 @@ use wayland_client::backend::WaylandError;
 
 /// return the error during running the eventloop
 #[derive(Debug, thiserror::Error)]
-pub enum SessonLockEventError {
+pub enum SessionLockEventError {
     #[error("connect error")]
     ConnectError(#[from] ConnectError),
     #[error("Global Error")]
@@ -393,6 +393,10 @@ impl<T> WindowStateUnit<T> {
         self.binding.as_mut()
     }
 
+    pub fn get_binding(&self) -> Option<&T> {
+        self.binding.as_ref()
+    }
+
     pub fn get_size(&self) -> (u32, u32) {
         self.size
     }
@@ -465,6 +469,15 @@ impl<T: 'static> WindowStateUnit<T> {
         }
     }
 }
+
+#[derive(Debug)]
+struct KeyboardTokenState {
+    delay: Duration,
+    key: u32,
+    surface_id: Option<id::Id>,
+    pressed_state: ElementState,
+}
+
 #[derive(Debug)]
 pub struct WindowState<T> {
     outputs: Vec<(u32, wl_output::WlOutput)>,
@@ -489,9 +502,13 @@ pub struct WindowState<T> {
     pointer: Option<WlPointer>,
     touch: Option<WlTouch>,
 
+    // settings:
+    to_remove_tokens: Vec<RegistrationToken>,
+    repeat_delay: Option<KeyboardTokenState>,
+    closed_ids: Vec<id::Id>,
+
     // keyboard
     use_display_handle: bool,
-    loop_handler: Option<LoopHandle<'static, Self>>,
 
     finger_locations: HashMap<i32, (f64, f64)>,
     enter_serial: Option<u32>,
@@ -513,10 +530,6 @@ pub enum RefreshRequest {
 }
 
 impl<T> WindowState<T> {
-    /// with loop_handler you can do more thing
-    pub fn get_loop_handler(&self) -> Option<&LoopHandle<'static, Self>> {
-        self.loop_handler.as_ref()
-    }
     /// get a seat from state
     pub fn get_seat(&self) -> &WlSeat {
         self.seat.as_ref().unwrap()
@@ -614,8 +627,11 @@ impl<T> Default for WindowState<T> {
             pointer: None,
             touch: None,
 
+            to_remove_tokens: Vec::new(),
+            repeat_delay: None,
+            closed_ids: Vec::new(),
+
             use_display_handle: false,
-            loop_handler: None,
 
             finger_locations: HashMap::new(),
             enter_serial: None,
@@ -744,7 +760,12 @@ impl<T: 'static> Dispatch<wl_registry::WlRegistry, ()> for WindowState<T> {
             }
             wl_registry::Event::GlobalRemove { name } => {
                 state.outputs.retain(|x| x.0 != name);
-                state.units.retain(|unit| unit.wl_surface.is_alive());
+                let removed_states = state
+                    .units
+                    .extract_if(.., |unit| !unit.wl_surface.is_alive());
+                for deleled in removed_states.into_iter() {
+                    state.closed_ids.push(deleled.id);
+                }
             }
 
             _ => {}
@@ -766,17 +787,21 @@ impl<T: 'static> Dispatch<wl_seat::WlSeat, ()> for WindowState<T> {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
+            if capabilities.is_empty() && state.keyboard_state.is_some() {
+                let keyboard = state.keyboard_state.take().unwrap();
+                drop(keyboard);
+            }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 if state.keyboard_state.is_none() {
                     state.keyboard_state = Some(KeyboardState::new(seat.get_keyboard(qh, ())));
                 } else {
                     let keyboard = state.keyboard_state.take().unwrap();
-                    drop(keyboard);
-                    if let Some(surface_id) = state.current_surface_id() {
-                        state
-                            .message
-                            .push((Some(surface_id), DispatchMessageInner::UnFocused));
-                    }
+                    state.keyboard_state = Some(keyboard.update(seat, qh, ()));
+                }
+                if let Some(surface_id) = state.current_surface_id() {
+                    state
+                        .message
+                        .push((Some(surface_id), DispatchMessageInner::UnFocused));
                 }
             }
             if capabilities.contains(wl_seat::Capability::Pointer) {
@@ -784,7 +809,9 @@ impl<T: 'static> Dispatch<wl_seat::WlSeat, ()> for WindowState<T> {
                     state.pointer = Some(seat.get_pointer(qh, ()));
                 } else {
                     let pointer = state.pointer.take().unwrap();
-                    pointer.release();
+                    if pointer.version() >= 3 {
+                        pointer.release();
+                    }
                 }
             }
             if capabilities.contains(wl_seat::Capability::Touch) {
@@ -810,13 +837,18 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        if state.keyboard_state.is_none() {
+            return;
+        }
+
         use keyboard::*;
         use xkb_keyboard::ElementState;
         let surface_id = state.current_surface_id();
-        let keyboard_state = state.keyboard_state.as_mut().unwrap();
+
         match event {
             wl_keyboard::Event::Keymap { format, fd, size } => match format {
                 WEnum::Value(KeymapFormat::XkbV1) => {
+                    let keyboard_state = state.keyboard_state.as_mut().unwrap();
                     let context = &mut keyboard_state.xkb_context;
                     context.set_keymap_from_fd(fd, size as usize)
                 }
@@ -825,15 +857,15 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 }
                 _ => unreachable!(),
             },
-            wl_keyboard::Event::Enter { .. } => {
-                if let (Some(token), Some(loop_handle)) = (
-                    keyboard_state.repeat_token.take(),
-                    state.loop_handler.as_ref(),
-                ) {
-                    loop_handle.remove(token);
+            wl_keyboard::Event::Enter { surface, .. } => {
+                state.update_current_surface(Some(surface));
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
+                if let Some(token) = keyboard_state.repeat_token.take() {
+                    state.to_remove_tokens.push(token);
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 keyboard_state.current_repeat = None;
                 state.message.push((
                     surface_id,
@@ -842,11 +874,8 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 state
                     .message
                     .push((surface_id, DispatchMessageInner::UnFocused));
-                if let (Some(token), Some(loop_handle)) = (
-                    keyboard_state.repeat_token.take(),
-                    state.loop_handler.as_ref(),
-                ) {
-                    loop_handle.remove(token);
+                if let Some(token) = keyboard_state.repeat_token.take() {
+                    state.to_remove_tokens.push(token);
                 }
             }
             wl_keyboard::Event::Key {
@@ -861,6 +890,7 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                         return;
                     }
                 };
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 let key = key + 8;
                 if let Some(mut key_context) = keyboard_state.xkb_context.key_context() {
                     let event = key_context.process_key_event(key, pressed_state, false);
@@ -870,68 +900,34 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                     };
                     state.message.push((surface_id, event));
                 }
+
                 match pressed_state {
                     ElementState::Pressed => {
                         let delay = match keyboard_state.repeat_info {
                             RepeatInfo::Repeat { delay, .. } => delay,
                             RepeatInfo::Disable => return,
                         };
-                        if !keyboard_state
+
+                        if keyboard_state
                             .xkb_context
                             .keymap_mut()
-                            .is_some_and(|keymap| keymap.key_repeats(key))
+                            .is_none_or(|keymap| !keymap.key_repeats(key))
                         {
                             return;
                         }
 
                         keyboard_state.current_repeat = Some(key);
 
-                        if let (Some(token), Some(loop_handle)) = (
-                            keyboard_state.repeat_token.take(),
-                            state.loop_handler.as_ref(),
-                        ) {
-                            loop_handle.remove(token);
+                        if let Some(token) = keyboard_state.repeat_token.take() {
+                            state.to_remove_tokens.push(token);
                         }
-                        let timer = Timer::from_duration(delay);
 
-                        if let Some(looph) = state.loop_handler.as_ref() {
-                            looph
-                                .insert_source(timer, move |_, _, state| {
-                                    let keyboard_state = match state.keyboard_state.as_mut() {
-                                        Some(keyboard_state) => keyboard_state,
-                                        None => return TimeoutAction::Drop,
-                                    };
-                                    let repeat_keycode = match keyboard_state.current_repeat {
-                                        Some(repeat_keycode) => repeat_keycode,
-                                        None => return TimeoutAction::Drop,
-                                    };
-                                    // NOTE: not the same key
-                                    if repeat_keycode != key {
-                                        return TimeoutAction::Drop;
-                                    }
-                                    if let Some(mut key_context) =
-                                        keyboard_state.xkb_context.key_context()
-                                    {
-                                        let event = key_context.process_key_event(
-                                            repeat_keycode,
-                                            pressed_state,
-                                            false,
-                                        );
-                                        let event = DispatchMessageInner::KeyboardInput {
-                                            event,
-                                            is_synthetic: false,
-                                        };
-                                        state.message.push((surface_id, event));
-                                    }
-                                    match keyboard_state.repeat_info {
-                                        RepeatInfo::Repeat { gap, .. } => {
-                                            TimeoutAction::ToDuration(gap)
-                                        }
-                                        RepeatInfo::Disable => TimeoutAction::Drop,
-                                    }
-                                })
-                                .ok();
-                        }
+                        state.repeat_delay = Some(KeyboardTokenState {
+                            delay,
+                            key,
+                            surface_id,
+                            pressed_state,
+                        });
                     }
                     ElementState::Released => {
                         if keyboard_state.repeat_info != RepeatInfo::Disable
@@ -942,11 +938,8 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                             && Some(key) == keyboard_state.current_repeat
                         {
                             keyboard_state.current_repeat = None;
-                            if let (Some(token), Some(loop_handle)) = (
-                                keyboard_state.repeat_token.take(),
-                                state.loop_handler.as_ref(),
-                            ) {
-                                loop_handle.remove(token);
+                            if let Some(token) = keyboard_state.repeat_token.take() {
+                                state.to_remove_tokens.push(token);
                             }
                         }
                     }
@@ -959,6 +952,7 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 group,
                 ..
             } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 let xkb_context = &mut keyboard_state.xkb_context;
                 let xkb_state = match xkb_context.state_mut() {
                     Some(state) => state,
@@ -973,14 +967,12 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 ))
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 keyboard_state.repeat_info = if rate == 0 {
                     // Stop the repeat once we get a disable event.
                     keyboard_state.current_repeat = None;
-                    if let (Some(token), Some(loop_handle)) = (
-                        keyboard_state.repeat_token.take(),
-                        state.loop_handler.as_ref(),
-                    ) {
-                        loop_handle.remove(token);
+                    if let Some(token) = keyboard_state.repeat_token.take() {
+                        state.to_remove_tokens.push(token);
                     }
                     RepeatInfo::Disable
                 } else {
@@ -1409,7 +1401,7 @@ delegate_noop!(@<T>WindowState<T>: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(@<T>WindowState<T>: ignore WpFractionalScaleManagerV1);
 
 impl<T: 'static> WindowState<T> {
-    pub fn build(mut self) -> Result<Self, SessonLockEventError> {
+    pub fn build(mut self) -> Result<Self, SessionLockEventError> {
         let connection = if let Some(connection) = self.connection.take() {
             connection
         } else {
@@ -1474,6 +1466,7 @@ impl<T: 'static> WindowState<T> {
                 qh: qh.clone(),
             });
         }
+        self.viewporter = viewporter;
         self.connection = Some(connection);
         self.event_queue = Some(event_queue);
         self.wl_compositor = Some(wmcompositer);
@@ -1492,9 +1485,9 @@ impl<T: 'static> WindowState<T> {
     /// Different with running, it receiver a receiver
     pub fn running_with_proxy<F, Message>(
         self,
-        message_receiver: std::sync::mpsc::Receiver<Message>,
+        message_receiver: Channel<Message>,
         event_handler: F,
-    ) -> Result<(), SessonLockEventError>
+    ) -> Result<(), SessionLockEventError>
     where
         Message: std::marker::Send + 'static,
         F: FnMut(SessionLockEvent<T, Message>, &mut WindowState<T>, Option<id::Id>) -> ReturnData
@@ -1507,7 +1500,7 @@ impl<T: 'static> WindowState<T> {
     /// happened on, like tell you this time you do a click, what surface it is on. you can use the
     /// index to get the unit, with [WindowState::get_unit_with_id] if the even is not spical on one surface,
     /// it will return [None].
-    pub fn running<F>(self, event_handler: F) -> Result<(), SessonLockEventError>
+    pub fn running<F>(self, event_handler: F) -> Result<(), SessionLockEventError>
     where
         F: FnMut(SessionLockEvent<T, ()>, &mut WindowState<T>, Option<id::Id>) -> ReturnData
             + 'static,
@@ -1517,17 +1510,17 @@ impl<T: 'static> WindowState<T> {
 
     fn running_with_proxy_option<F, Message>(
         mut self,
-        message_receiver: Option<std::sync::mpsc::Receiver<Message>>,
+        message_receiver: Option<Channel<Message>>,
         mut event_handler: F,
-    ) -> Result<(), SessonLockEventError>
+    ) -> Result<(), SessionLockEventError>
     where
         Message: std::marker::Send + 'static,
         F: FnMut(SessionLockEvent<T, Message>, &mut WindowState<T>, Option<id::Id>) -> ReturnData
             + 'static,
     {
         let globals = self.globals.take().unwrap();
-        let event_queue = self.event_queue.take().unwrap();
-        let qh = event_queue.handle();
+        let mut event_queue_origin = self.event_queue.take().unwrap();
+        let qh = event_queue_origin.handle();
         let wmcompositer = self.wl_compositor.take().unwrap();
         let shm = self.shm.take().unwrap();
         let fractional_scale_manager = self.fractional_scale_manager.take();
@@ -1566,225 +1559,269 @@ impl<T: 'static> WindowState<T> {
         }
 
         self.message.clear();
-        let mut event_loop: EventLoop<Self> =
+
+        struct EventWrapper<Raw, F> {
+            raw: Raw,
+            fun: F,
+            loop_handle: LoopHandle<'static, Self>,
+        }
+
+        let mut event_loop: EventLoop<_> =
             EventLoop::try_new().expect("Failed to initialize the event loop");
 
+        let event_queue = connection.new_event_queue::<EventWrapper<Self, F>>();
         WaylandSource::new(connection.clone(), event_queue)
             .insert(event_loop.handle())
             .expect("Failed to init Wayland Source");
+        let mut state = EventWrapper {
+            raw: self,
+            fun: event_handler,
+            loop_handle: event_loop.handle(),
+        };
 
-        self.loop_handler = Some(event_loop.handle());
-        let to_exit = Arc::new(AtomicBool::new(false));
-
-        let events: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let to_exit2 = to_exit.clone();
-        let events_2 = events.clone();
-        let thread = std::thread::spawn(move || {
-            let to_exit = to_exit2;
-            let events = events_2;
-            let Some(message_receiver) = message_receiver else {
-                return;
-            };
-            for message in message_receiver.iter() {
-                if to_exit.load(Ordering::Relaxed) {
-                    break;
-                }
-                let mut events_local = events.lock().unwrap();
-                events_local.push(message);
-            }
-        });
         let signal = event_loop.get_signal();
-        event_loop
-            .handle()
-            .insert_source(
-                Timer::from_duration(Duration::from_millis(50)),
-                move |_, _, window_state| {
-                    let mut messages = Vec::new();
-                    std::mem::swap(&mut messages, &mut window_state.message);
-                    for msg in messages.iter() {
-                        match msg {
-                            (_, DispatchMessageInner::NewDisplay(display)) => {
-                                let wl_surface = wmcompositer.create_surface(&qh, ()); // and create a surface. if two or more,
-                                //
-                                wl_surface.commit();
-                                let session_lock_surface =
-                                    lock.get_lock_surface(&wl_surface, display, &qh, ());
-
-                                let mut fractional_scale = None;
-                                if let Some(ref fractional_scale_manager) = fractional_scale_manager
-                                {
-                                    fractional_scale =
-                                        Some(fractional_scale_manager.get_fractional_scale(
-                                            &wl_surface,
-                                            &qh,
-                                            (),
-                                        ));
-                                }
-                                // so during the init Configure of the shell, a buffer, atleast a buffer is needed.
-                                // and if you need to reconfigure it, you need to commit the wl_surface again
-                                // so because this is just an example, so we just commit it once
-                                // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
-                                let viewport = viewporter
-                                    .as_ref()
-                                    .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
-                                window_state.push_window(WindowStateUnit {
-                                    id: id::Id::unique(),
-                                    display: connection.display(),
-                                    wl_surface,
-                                    size: (0, 0),
-                                    buffer: None,
-                                    session_shell: session_lock_surface,
-                                    viewport,
-                                    fractional_scale,
-                                    binding: None,
-                                    scale: 120,
-                                    present_available_state: PresentAvailableState::Available,
-                                    refresh: RefreshRequest::Wait,
-                                    qh: qh.clone(),
-                                });
-                            }
-                            _ => {
-                                let (index_message, msg) = msg;
-                                let msg: DispatchMessage = msg.clone().into();
-                                match event_handler(
-                                    SessionLockEvent::RequestMessages(&msg),
-                                    window_state,
-                                    *index_message,
-                                ) {
-                                    ReturnData::RequestUnlockAndExist => {
-                                        lock.unlock_and_destroy();
-                                        connection
-                                            .roundtrip()
-                                            .expect("should roundtrip successfully");
-                                        signal.stop();
-                                        return TimeoutAction::Drop;
-                                    }
-                                    ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
-                                        let Some(serial) = window_state.enter_serial else {
-                                            continue;
-                                        };
-                                        set_cursor_shape(
-                                            &cursor_update_context,
-                                            shape_name,
-                                            pointer,
-                                            serial,
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    let mut local_events = events.lock().unwrap();
-                    let mut swapped_events: Vec<Message> = vec![];
-                    std::mem::swap(&mut *local_events, &mut swapped_events);
-                    drop(local_events);
-                    for event in swapped_events {
-                        window_state.handle_event(
-                            &mut event_handler,
-                            SessionLockEvent::UserEvent(event),
-                            None,
-                        );
-                    }
-
+        if let Some(channel) = message_receiver {
+            event_loop
+                .handle()
+                .insert_source(channel, |event, _, r_window_state| {
+                    let channel::Event::Msg(event) = event else {
+                        return;
+                    };
+                    let window_state = &mut r_window_state.raw;
+                    let event_handler = &mut r_window_state.fun;
                     window_state.handle_event(
-                        &mut event_handler,
-                        SessionLockEvent::NormalDispatch,
+                        &mut *event_handler,
+                        SessionLockEvent::UserEvent(event),
                         None,
                     );
-                    loop {
-                        let mut return_data = vec![];
+                })
+                .expect("We need message state");
+        }
 
-                        std::mem::swap(&mut window_state.return_data, &mut return_data);
-                        for data in return_data {
-                            match data {
-                                ReturnData::RequestUnlockAndExist => {
-                                    lock.unlock_and_destroy();
-                                    connection.roundtrip().expect("should go final roundtrip");
-                                    signal.stop();
-                                    return TimeoutAction::Drop;
-                                }
-                                ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
-                                    let Some(serial) = window_state.enter_serial else {
-                                        continue;
-                                    };
-                                    set_cursor_shape(
-                                        &cursor_update_context,
-                                        shape_name,
-                                        pointer,
-                                        serial,
-                                    );
-                                }
-                                _ => {}
-                            }
+        let process_window_state = |window_state: &mut WindowState<T>, event_handler: &mut F| {
+            let mut messages = Vec::new();
+            std::mem::swap(&mut messages, &mut window_state.message);
+            for msg in messages.iter() {
+                match msg {
+                    (_, DispatchMessageInner::NewDisplay(display)) => {
+                        let wl_surface = wmcompositer.create_surface(&qh, ());
+                        wl_surface.commit();
+                        let session_lock_surface =
+                            lock.get_lock_surface(&wl_surface, display, &qh, ());
+
+                        let mut fractional_scale = None;
+                        if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                            fractional_scale = Some(fractional_scale_manager.get_fractional_scale(
+                                &wl_surface,
+                                &qh,
+                                (),
+                            ));
                         }
-                        window_state.return_data.retain(|x| *x != ReturnData::None);
-                        if window_state.return_data.is_empty() {
-                            break;
+                        let viewport = viewporter
+                            .as_ref()
+                            .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+                        window_state.push_window(WindowStateUnit {
+                            id: id::Id::unique(),
+                            display: connection.display(),
+                            wl_surface,
+                            size: (0, 0),
+                            buffer: None,
+                            session_shell: session_lock_surface,
+                            viewport,
+                            fractional_scale,
+                            binding: None,
+                            scale: 120,
+                            present_available_state: PresentAvailableState::Available,
+                            refresh: RefreshRequest::Wait,
+                            qh: qh.clone(),
+                        });
+                    }
+                    _ => {
+                        let (index_message, msg) = msg;
+                        let msg: DispatchMessage = msg.clone().into();
+                        match event_handler(
+                            SessionLockEvent::RequestMessages(&msg),
+                            window_state,
+                            *index_message,
+                        ) {
+                            ReturnData::RequestUnlockAndExist => {
+                                lock.unlock_and_destroy();
+                                connection
+                                    .roundtrip()
+                                    .expect("should roundtrip successfully");
+                                signal.stop();
+                                return true;
+                            }
+                            ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                                let Some(serial) = window_state.enter_serial else {
+                                    continue;
+                                };
+                                set_cursor_shape(
+                                    &cursor_update_context,
+                                    shape_name,
+                                    pointer,
+                                    serial,
+                                );
+                            }
+                            _ => {}
                         }
                     }
-                    for idx in 0..window_state.units.len() {
-                        let unit = &mut window_state.units[idx];
-                        let (width, height) = unit.size;
-                        if width == 0 || height == 0 {
-                            // don't refresh, if size is 0.
-                            continue;
+                }
+            }
+            window_state.handle_event(&mut *event_handler, SessionLockEvent::NormalDispatch, None);
+            loop {
+                let mut return_data = vec![];
+
+                std::mem::swap(&mut window_state.return_data, &mut return_data);
+                for data in return_data {
+                    match data {
+                        ReturnData::RequestUnlockAndExist => {
+                            lock.unlock_and_destroy();
+                            connection.roundtrip().expect("should go final roundtrip");
+                            signal.stop();
+                            return true;
                         }
-                        if unit.take_present_slot() {
-                            let unit_id = unit.id;
-                            let scale_float = unit.scale_float();
-                            let wl_surface = unit.wl_surface.clone();
-                            if unit.buffer.is_none() && !window_state.use_display_handle {
-                                let Ok(mut file) = tempfile::tempfile() else {
-                                    log::error!("Cannot create new file from tempfile");
-                                    return TimeoutAction::Drop;
-                                };
-                                let ReturnData::WlBuffer(buffer) = event_handler(
-                                    SessionLockEvent::RequestBuffer(
-                                        &mut file, &shm, &qh, width, height,
-                                    ),
-                                    window_state,
-                                    Some(unit_id),
-                                ) else {
-                                    panic!("You cannot return this one");
-                                };
-                                wl_surface.attach(Some(&buffer), 0, 0);
-                                wl_surface.commit();
-                                window_state.units[idx].buffer = Some(buffer);
-                            }
-                            window_state.handle_event(
-                                &mut event_handler,
-                                SessionLockEvent::RequestMessages(
-                                    &DispatchMessage::RequestRefresh {
-                                        width,
-                                        height,
-                                        scale_float,
-                                    },
-                                ),
-                                Some(unit_id),
-                            );
-                            // reset if the slot is not used
-                            window_state.units[idx].reset_present_slot();
+                        ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                            let Some(serial) = window_state.enter_serial else {
+                                continue;
+                            };
+                            set_cursor_shape(&cursor_update_context, shape_name, pointer, serial);
                         }
+                        _ => {}
                     }
-                    TimeoutAction::ToDuration(Duration::from_millis(50))
-                },
-            )
-            .expect("Cannot insert source");
+                }
+                window_state.return_data.retain(|x| *x != ReturnData::None);
+                if window_state.return_data.is_empty() {
+                    break;
+                }
+            }
+            let closed_ids = window_state.closed_ids.clone();
+            for id in closed_ids {
+                window_state.handle_event(
+                    &mut *event_handler,
+                    SessionLockEvent::RequestMessages(&DispatchMessage::Closed),
+                    Some(id),
+                );
+            }
+            window_state.closed_ids.clear();
+
+            for idx in 0..window_state.units.len() {
+                let unit = &mut window_state.units[idx];
+                let (width, height) = unit.size;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                if unit.take_present_slot() {
+                    let unit_id = unit.id;
+                    let scale_float = unit.scale_float();
+                    let wl_surface = unit.wl_surface.clone();
+                    if unit.buffer.is_none() && !window_state.use_display_handle {
+                        let Ok(mut file) = tempfile::tempfile() else {
+                            log::error!("Cannot create new file from tempfile");
+                            return false;
+                        };
+                        let ReturnData::WlBuffer(buffer) = event_handler(
+                            SessionLockEvent::RequestBuffer(&mut file, &shm, &qh, width, height),
+                            window_state,
+                            Some(unit_id),
+                        ) else {
+                            panic!("You cannot return this one");
+                        };
+                        wl_surface.attach(Some(&buffer), 0, 0);
+                        wl_surface.commit();
+                        window_state.units[idx].buffer = Some(buffer);
+                    }
+                    window_state.handle_event(
+                        &mut *event_handler,
+                        SessionLockEvent::RequestMessages(&DispatchMessage::RequestRefresh {
+                            width,
+                            height,
+                            scale_float,
+                        }),
+                        Some(unit_id),
+                    );
+                    window_state.units[idx].reset_present_slot();
+                }
+            }
+
+            false
+        };
         event_loop
             .run(
                 std::time::Duration::from_millis(20),
-                &mut self,
-                |_window_state| {
-                    // Finally, this is where you can insert the processing you need
-                    // to do do between each waiting event eg. drawing logic if
-                    // you're doing a GUI app.
+                &mut state,
+                move |r_window_state| {
+                    let window_state = &mut r_window_state.raw;
+                    let _ = event_queue_origin.roundtrip(window_state);
+                    let event_handler = &mut r_window_state.fun;
+                    if process_window_state(window_state, event_handler) {
+                        return;
+                    }
+                    let looph = &r_window_state.loop_handle;
+                    for token in window_state.to_remove_tokens.iter() {
+                        looph.remove(*token);
+                    }
+                    window_state.to_remove_tokens.clear();
+
+                    if let Some(KeyboardTokenState {
+                        key,
+                        delay,
+                        surface_id,
+                        pressed_state,
+                    }) = window_state.repeat_delay.take()
+                    {
+                        let timer = Timer::from_duration(delay);
+                        let keyboard_state = window_state.keyboard_state.as_mut().unwrap();
+                        keyboard_state.repeat_token = looph
+                            .insert_source(timer, move |_, _, r_window_state| {
+                                let state = &mut r_window_state.raw;
+                                let event_handler = &mut r_window_state.fun;
+                                let keyboard_state = match state.keyboard_state.as_mut() {
+                                    Some(keyboard_state) => keyboard_state,
+                                    None => return TimeoutAction::Drop,
+                                };
+                                let repeat_keycode = match keyboard_state.current_repeat {
+                                    Some(repeat_keycode) => repeat_keycode,
+                                    None => return TimeoutAction::Drop,
+                                };
+                                // NOTE: not the same key
+                                if repeat_keycode != key {
+                                    return TimeoutAction::Drop;
+                                }
+                                if let Some(mut key_context) =
+                                    keyboard_state.xkb_context.key_context()
+                                {
+                                    let event = key_context.process_key_event(
+                                        repeat_keycode,
+                                        pressed_state,
+                                        false,
+                                    );
+                                    let event = DispatchMessageInner::KeyboardInput {
+                                        event,
+                                        is_synthetic: false,
+                                    };
+                                    state.message.push((surface_id, event));
+                                }
+                                let repeat_info = keyboard_state.repeat_info;
+
+                                let _ = keyboard_state;
+                                state.handle_event(
+                                    &mut *event_handler,
+                                    SessionLockEvent::NormalDispatch,
+                                    None,
+                                );
+                                match repeat_info {
+                                    RepeatInfo::Repeat { gap, .. } => {
+                                        TimeoutAction::ToDuration(gap)
+                                    }
+                                    RepeatInfo::Disable => TimeoutAction::Drop,
+                                }
+                            })
+                            .ok();
+                    }
                 },
             )
             .expect("Error during event loop!");
-        to_exit.store(true, Ordering::Relaxed);
-        let _ = thread.join();
         Ok(())
     }
 }

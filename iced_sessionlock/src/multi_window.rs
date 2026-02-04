@@ -13,21 +13,23 @@ use std::{
 use crate::{clipboard::SessionLockClipboard, conversion, error::Error};
 
 use super::DefaultStyle;
-use iced_graphics::{Compositor, compositor};
+#[cfg(not(all(feature = "linux-theme-detection", target_os = "linux")))]
+use iced_core::theme::Mode;
+use iced_graphics::{Compositor, Shell, compositor};
 
 use iced_core::{Size, time::Instant};
 use iced_runtime::{Action, UserInterface, user_interface};
 
 use iced_futures::{Executor, Runtime};
 
-use iced::{
+use iced_core::{
     Event as IcedEvent,
     mouse::Cursor,
     theme,
     window::{Event as IcedWindowEvent, Id as IcedId, RedrawRequest},
 };
 
-use iced_runtime::debug;
+use iced_debug as debug;
 use sessionlockev::RefreshRequest;
 use sessionlockev::id::Id as SessionLockId;
 use sessionlockev::{ReturnData, SessionLockEvent, WindowState, WindowWrapper};
@@ -54,8 +56,9 @@ where
     P::Message: 'static + TryInto<UnLockAction, Error = P::Message>,
 {
     use futures::task;
+    use sessionlockev::calloop::channel::channel;
 
-    let (message_sender, message_receiver) = std::sync::mpsc::channel::<Action<P::Message>>();
+    let (message_sender, message_receiver) = channel::<Action<P::Message>>();
     let boot_span = debug::boot();
     let proxy = IcedProxy::new(message_sender);
 
@@ -68,6 +71,7 @@ where
         });
     }
 
+    let proxy_back = proxy.clone();
     let mut runtime: SessionRuntime<P::Executor, P::Message> = {
         let executor = P::Executor::new().map_err(Error::ExecutorCreationFailed)?;
 
@@ -83,6 +87,7 @@ where
     runtime.track(iced_futures::subscription::into_recipes(
         runtime.enter(|| application.subscription().map(Action::Output)),
     ));
+    #[cfg(all(feature = "linux-theme-detection", target_os = "linux"))]
     let system_theme = {
         let to_mode = |color_scheme| match color_scheme {
             mundy::ColorScheme::NoPreference => theme::Mode::None,
@@ -100,13 +105,19 @@ where
                 .boxed(),
         );
 
-        mundy::Preferences::once_blocking(
-            mundy::Interest::ColorScheme,
-            core::time::Duration::from_millis(200),
-        )
-        .map(|preferences| to_mode(preferences.color_scheme))
-        .unwrap_or_default()
+        runtime
+            .enter(|| {
+                mundy::Preferences::once_blocking(
+                    mundy::Interest::ColorScheme,
+                    core::time::Duration::from_millis(200),
+                )
+            })
+            .map(|preferences| to_mode(preferences.color_scheme))
+            .unwrap_or_default()
     };
+
+    #[cfg(not(all(feature = "linux-theme-detection", target_os = "linux")))]
+    let system_theme = Mode::default();
 
     let ev: WindowState<()> = sessionlockev::WindowState::new()
         .with_use_display_handle(true)
@@ -117,7 +128,7 @@ where
     let mut task_context = task::Context::from_waker(task::noop_waker_ref());
     let context = Context::<
         P,
-        <P as iced::Program>::Executor,
+        <P as iced_program::Program>::Executor,
         <P::Renderer as iced_graphics::compositor::Default>::Compositor,
     >::new(
         application,
@@ -125,6 +136,7 @@ where
         runtime,
         settings.fonts,
         system_theme,
+        proxy_back,
     );
     let mut context_state = ContextState::Context(context);
     boot_span.finish();
@@ -205,7 +217,7 @@ where
 {
     compositor_settings: iced_graphics::Settings,
     runtime: SessionRuntime<E, P::Message>,
-    system_theme: iced::theme::Mode,
+    system_theme: iced_core::theme::Mode,
     fonts: Vec<Cow<'static, [u8]>>,
     compositor: Option<C>,
     window_manager: WindowManager<P, C>,
@@ -214,6 +226,7 @@ where
     user_interfaces: UserInterfaces<P>,
     iced_events: Vec<(IcedId, IcedEvent)>,
     messages: Vec<P::Message>,
+    proxy: IcedProxy<Action<P::Message>>,
 }
 
 impl<P, E, C> Context<P, E, C>
@@ -229,7 +242,8 @@ where
         compositor_settings: iced_graphics::Settings,
         runtime: SessionRuntime<E, P::Message>,
         fonts: Vec<Cow<'static, [u8]>>,
-        system_theme: iced::theme::Mode,
+        system_theme: iced_core::theme::Mode,
+        proxy: IcedProxy<Action<P::Message>>,
     ) -> Self {
         Self {
             compositor_settings,
@@ -243,13 +257,20 @@ where
             user_interfaces: UserInterfaces::new(application),
             iced_events: Default::default(),
             messages: Default::default(),
+            proxy,
         }
     }
 
     async fn create_compositor(mut self, window: Arc<WindowWrapper>) -> Self {
-        let mut new_compositor = C::new(self.compositor_settings, window.clone())
-            .await
-            .expect("Cannot create compositer");
+        let shell = Shell::new(self.proxy.clone());
+        let mut new_compositor = C::new(
+            self.compositor_settings,
+            window.clone(),
+            window.clone(),
+            shell,
+        )
+        .await
+        .expect("Cannot create compositer");
         for font in self.fonts.clone() {
             new_compositor.load_font(font);
         }
@@ -258,7 +279,6 @@ where
         self
     }
 
-    #[allow(unused)]
     fn remove_compositor(&mut self) {
         self.compositor = None;
         self.clipboard = SessionLockClipboard::unconnected();
@@ -294,7 +314,9 @@ where
             IcedSessionLockEvent::Window(WindowEvent::Refresh) => {
                 self.handle_refresh_event(ev, session_lock_id)
             }
-
+            IcedSessionLockEvent::Window(WindowEvent::Closed) => {
+                self.handle_closed_event(session_lock_id)
+            }
             IcedSessionLockEvent::Window(window_event) => {
                 self.handle_window_event(session_lock_id, window_event)
             }
@@ -335,6 +357,9 @@ where
                     ui.relayout(window.state.viewport().logical_size(), &mut window.renderer);
                 }
                 layout_span.finish();
+                events.push(IcedEvent::Window(IcedWindowEvent::Resized(
+                    window.state.window_size_f32(),
+                )));
             }
             (id, window)
         } else {
@@ -468,6 +493,28 @@ where
             },
         }
     }
+
+    fn handle_closed_event(&mut self, session_lock_id: Option<SessionLockId>) {
+        let Some(session_lock_id) = session_lock_id else {
+            return;
+        };
+        let Some(iced_id) = self.window_manager.get_iced_id(session_lock_id) else {
+            return;
+        };
+        self.cached_layer_dimensions.remove(&iced_id);
+        self.window_manager.remove(iced_id);
+        self.user_interfaces.remove(&iced_id);
+        self.runtime
+            .broadcast(iced_futures::subscription::Event::Interaction {
+                window: iced_id,
+                event: IcedEvent::Window(IcedWindowEvent::Closed),
+                status: iced_core::event::Status::Ignored,
+            });
+        if self.window_manager.is_empty() {
+            self.remove_compositor();
+        }
+    }
+
     fn handle_window_event(&mut self, session_lock_id: Option<SessionLockId>, event: WindowEvent) {
         let id_and_window = if let Some(layer_shell_id) = session_lock_id {
             self.window_manager.get_mut_alias(layer_shell_id)
@@ -650,8 +697,8 @@ where
 pub fn build_user_interfaces<'a, P: Program, C>(
     application: &'a Instance<P>,
     window_manager: &mut WindowManager<P, C>,
-    mut cached_user_interfaces: HashMap<iced::window::Id, user_interface::Cache>,
-) -> HashMap<iced::window::Id, UserInterface<'a, P::Message, P::Theme, P::Renderer>>
+    mut cached_user_interfaces: HashMap<iced_core::window::Id, user_interface::Cache>,
+) -> HashMap<iced_core::window::Id, UserInterface<'a, P::Message, P::Theme, P::Renderer>>
 where
     C: Compositor<Renderer = P::Renderer>,
     P::Theme: DefaultStyle,
@@ -682,7 +729,7 @@ fn build_user_interface<'a, A: Program>(
     cache: user_interface::Cache,
     renderer: &mut A::Renderer,
     size: Size,
-    id: iced::window::Id,
+    id: iced_core::window::Id,
 ) -> UserInterface<'a, A::Message, A::Theme, A::Renderer>
 where
     A::Theme: DefaultStyle,
@@ -729,7 +776,7 @@ pub(crate) fn run_action<P, C, E: Executor>(
     clipboard: &mut SessionLockClipboard,
     should_exit: &mut bool,
     window_manager: &mut WindowManager<P, C>,
-    system_theme: &mut iced::theme::Mode,
+    system_theme: &mut iced_core::theme::Mode,
     runtime: &mut SessionRuntime<E, P::Message>,
     ev: &mut WindowState<()>,
 ) where
@@ -756,6 +803,18 @@ pub(crate) fn run_action<P, C, E: Executor>(
             }
             clipboard::Action::Write { target, contents } => {
                 clipboard.write(target, contents);
+            }
+        },
+        Action::Image(action) => match action {
+            iced_runtime::image::Action::Allocate(handle, sender) => {
+                use iced_core::Renderer as _;
+
+                // TODO: Shared image cache in compositor
+                if let Some((_id, window)) = window_manager.iter_mut().next() {
+                    window.renderer.allocate_image(&handle, move |allocation| {
+                        let _ = sender.send(allocation);
+                    });
+                }
             }
         },
         Action::Widget(action) => {

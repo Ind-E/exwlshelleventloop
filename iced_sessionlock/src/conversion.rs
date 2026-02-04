@@ -4,8 +4,8 @@ use std::ops::Mul;
 
 use crate::event::IcedButtonState;
 use crate::event::WindowEvent as SessionLockEvent;
-use iced::touch;
 use iced_core::SmolStr;
+use iced_core::touch;
 use keymap::{key, physical_key};
 use sessionlockev::keyboard::KeyLocation;
 use sessionlockev::xkb_keyboard::ElementState;
@@ -36,7 +36,7 @@ pub fn window_event(
         SessionLockEvent::CursorMoved { x, y } => {
             let (x, y) = scale_down((*x, *y), application_scale_factor);
             Some(IcedEvent::Mouse(mouse::Event::CursorMoved {
-                position: iced::Point {
+                position: iced_core::Point {
                     x: x as f32,
                     y: y as f32,
                 },
@@ -60,7 +60,7 @@ pub fn window_event(
             let (x, y) = scale_down((*x, *y), application_scale_factor);
             Some(IcedEvent::Touch(touch::Event::FingerPressed {
                 id: touch::Finger(*id as u64),
-                position: iced::Point {
+                position: iced_core::Point {
                     x: x as f32,
                     y: y as f32,
                 },
@@ -70,7 +70,7 @@ pub fn window_event(
             let (x, y) = scale_down((*x, *y), application_scale_factor);
             Some(IcedEvent::Touch(touch::Event::FingerLifted {
                 id: touch::Finger(*id as u64),
-                position: iced::Point {
+                position: iced_core::Point {
                     x: x as f32,
                     y: y as f32,
                 },
@@ -80,7 +80,7 @@ pub fn window_event(
             let (x, y) = scale_down((*x, *y), application_scale_factor);
             Some(IcedEvent::Touch(touch::Event::FingerMoved {
                 id: touch::Finger(*id as u64),
-                position: iced::Point {
+                position: iced_core::Point {
                     x: x as f32,
                     y: y as f32,
                 },
@@ -90,7 +90,7 @@ pub fn window_event(
             let (x, y) = scale_down((*x, *y), application_scale_factor);
             Some(IcedEvent::Touch(touch::Event::FingerLost {
                 id: touch::Finger(*id as u64),
-                position: iced::Point {
+                position: iced_core::Point {
                     x: x as f32,
                     y: y as f32,
                 },
@@ -128,6 +128,7 @@ pub fn window_event(
                     text,
                     modified_key,
                     physical_key,
+                    repeat: false,
                 },
                 ElementState::Released => keyboard::Event::KeyReleased {
                     physical_key,
@@ -141,8 +142,8 @@ pub fn window_event(
         SessionLockEvent::ModifiersChanged(new_modifiers) => Some(IcedEvent::Keyboard(
             keyboard::Event::ModifiersChanged(keymap::modifiers(*new_modifiers)),
         )),
-        SessionLockEvent::Unfocus => Some(IcedEvent::Window(iced::window::Event::Unfocused)),
-        SessionLockEvent::Focused => Some(IcedEvent::Window(iced::window::Event::Focused)),
+        SessionLockEvent::Unfocus => Some(IcedEvent::Window(iced_core::window::Event::Unfocused)),
+        SessionLockEvent::Focused => Some(IcedEvent::Window(iced_core::window::Event::Focused)),
         _ => None,
     }
 }
@@ -153,8 +154,8 @@ pub(crate) fn mouse_interaction(interaction: mouse::Interaction) -> String {
     match interaction {
         Interaction::None => Shape::Default.name().to_owned(),
         Interaction::Idle => Shape::Wait.name().to_owned(),
+        Interaction::Wait => Shape::Wait.name().to_owned(),
         Interaction::Pointer => Shape::Pointer.name().to_owned(),
-        Interaction::Working => Shape::Pointer.name().to_owned(),
         Interaction::Grab => Shape::Grab.name().to_owned(),
         Interaction::Text => Shape::Text.name().to_owned(),
         Interaction::ZoomIn => Shape::ZoomIn.name().to_owned(),
@@ -170,6 +171,7 @@ pub(crate) fn mouse_interaction(interaction: mouse::Interaction) -> String {
         Interaction::ZoomOut => Shape::ZoomOut.name().to_owned(),
         Interaction::ResizingDiagonallyUp => Shape::NwseResize.name().to_owned(),
         Interaction::ResizingDiagonallyDown => Shape::NwseResize.name().to_owned(),
+        _ => Shape::Default.name().to_owned(),
     }
 }
 

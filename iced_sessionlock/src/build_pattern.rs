@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use iced::Font;
+use iced_core::Font;
 
 /// The renderer of iced program.
 pub use pattern::application;
@@ -8,7 +8,8 @@ pub use pattern::application;
 mod pattern {
     use super::*;
     use crate::settings::Settings;
-    use iced::{Element, Task};
+    use iced_core::Element;
+    use iced_runtime::Task;
 
     use crate::actions::UnLockAction;
 
@@ -24,16 +25,16 @@ mod pattern {
     ///
     /// This trait allows the [`application`] builder to take any closure that
     /// returns any `Into<Task<Message>>`.
-    pub trait Update<State, Message> {
+    pub trait UpdateFn<State, Message> {
         /// Processes the message and updates the state of the [`Application`].
         fn update(&self, state: &mut State, message: Message) -> impl Into<Task<Message>>;
     }
 
-    impl<State, Message> Update<State, Message> for () {
+    impl<State, Message> UpdateFn<State, Message> for () {
         fn update(&self, _state: &mut State, _message: Message) -> impl Into<Task<Message>> {}
     }
 
-    impl<T, State, Message, C> Update<State, Message> for T
+    impl<T, State, Message, C> UpdateFn<State, Message> for T
     where
         T: Fn(&mut State, Message) -> C,
         C: Into<Task<Message>>,
@@ -47,16 +48,17 @@ mod pattern {
     ///
     /// This trait allows the [`application`] builder to take any closure that
     /// returns any `Into<Element<'_, Message>>`.
-    pub trait View<'a, State, Message, Theme, Renderer> {
+    pub trait ViewFn<'a, State, Message, Theme, Renderer> {
         /// Produces the widget of the [`Application`].
         fn view(
             &self,
             state: &'a State,
             window: iced_core::window::Id,
-        ) -> impl Into<Element<'a, Message, Theme, Renderer>>;
+        ) -> Element<'a, Message, Theme, Renderer>;
     }
 
-    impl<'a, T, State, Message, Theme, Renderer, Widget> View<'a, State, Message, Theme, Renderer> for T
+    impl<'a, T, State, Message, Theme, Renderer, Widget> ViewFn<'a, State, Message, Theme, Renderer>
+        for T
     where
         T: Fn(&'a State, iced_core::window::Id) -> Widget,
         State: 'static,
@@ -66,17 +68,17 @@ mod pattern {
             &self,
             state: &'a State,
             window: iced_core::window::Id,
-        ) -> impl Into<Element<'a, Message, Theme, Renderer>> {
-            self(state, window)
+        ) -> Element<'a, Message, Theme, Renderer> {
+            self(state, window).into()
         }
     }
 
-    pub trait Boot<State, Message> {
+    pub trait BootFn<State, Message> {
         /// Initializes the [`Application`] state.
         fn boot(&self) -> (State, Task<Message>);
     }
 
-    impl<T, C, State, Message> Boot<State, Message> for T
+    impl<T, C, State, Message> BootFn<State, Message> for T
     where
         T: Fn() -> C,
         C: IntoBoot<State, Message>,
@@ -117,11 +119,15 @@ mod pattern {
         ///
         /// If `None` is returned, `iced` will try to use a theme that
         /// matches the system color scheme.
-        fn theme(&self, state: &State, window: iced::window::Id) -> Option<Theme>;
+        fn theme(&self, state: &State, window: iced_core::window::Id) -> Option<Theme>;
     }
 
-    impl<State> ThemeFn<State, iced::Theme> for iced::Theme {
-        fn theme(&self, _state: &State, _window: iced::window::Id) -> Option<iced::Theme> {
+    impl<State> ThemeFn<State, iced_core::Theme> for iced_core::Theme {
+        fn theme(
+            &self,
+            _state: &State,
+            _window: iced_core::window::Id,
+        ) -> Option<iced_core::Theme> {
             Some(self.clone())
         }
     }
@@ -131,7 +137,7 @@ mod pattern {
         F: Fn(&State) -> T,
         T: Into<Option<Theme>>,
     {
-        fn theme(&self, state: &State, _window: iced::window::Id) -> Option<Theme> {
+        fn theme(&self, state: &State, _window: iced_core::window::Id) -> Option<Theme> {
             (self)(state).into()
         }
     }
@@ -142,9 +148,9 @@ mod pattern {
     }
 
     pub fn application<State, Message, Theme, Renderer>(
-        boot: impl Boot<State, Message>,
-        update: impl Update<State, Message>,
-        view: impl for<'a> self::View<'a, State, Message, Theme, Renderer>,
+        boot: impl BootFn<State, Message>,
+        update: impl UpdateFn<State, Message>,
+        view: impl for<'a> self::ViewFn<'a, State, Message, Theme, Renderer>,
     ) -> Application<impl Program<Message = Message, Theme = Theme, State = State>>
     where
         State: 'static,
@@ -153,24 +159,24 @@ mod pattern {
         Renderer: iced_program::Renderer,
     {
         use std::marker::PhantomData;
-        struct Instance<State, Message, Theme, Renderer, Update, View, Boot> {
-            update: Update,
-            view: View,
-            boot: Boot,
+        struct Instance<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn> {
+            update: UpdateFn,
+            view: ViewFn,
+            boot: BootFn,
             _state: PhantomData<State>,
             _message: PhantomData<Message>,
             _theme: PhantomData<Theme>,
             _renderer: PhantomData<Renderer>,
         }
-        impl<State, Message, Theme, Renderer, Update, View, Boot> Program
-            for Instance<State, Message, Theme, Renderer, Update, View, Boot>
+        impl<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn> Program
+            for Instance<State, Message, Theme, Renderer, UpdateFn, ViewFn, BootFn>
         where
             Message: 'static + TryInto<UnLockAction, Error = Message> + Send + std::fmt::Debug,
             Theme: DefaultStyle,
             Renderer: iced_program::Renderer,
-            Update: self::Update<State, Message>,
-            Boot: self::Boot<State, Message>,
-            View: for<'a> self::View<'a, State, Message, Theme, Renderer>,
+            UpdateFn: self::UpdateFn<State, Message>,
+            BootFn: self::BootFn<State, Message>,
+            ViewFn: for<'a> self::ViewFn<'a, State, Message, Theme, Renderer>,
         {
             type State = State;
             type Renderer = Renderer;
@@ -193,14 +199,14 @@ mod pattern {
                 state: &'a Self::State,
                 window: iced_core::window::Id,
             ) -> Element<'a, Self::Message, Self::Theme, Self::Renderer> {
-                debug::hot(|| self.view.view(state, window)).into()
+                debug::hot(|| self.view.view(state, window))
             }
             fn name() -> &'static str {
                 let name = std::any::type_name::<State>();
 
                 name.split("::").next().unwrap_or("a_cool_application")
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -260,7 +266,10 @@ mod pattern {
                 self.program.view(state, window)
             }
 
-            fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+            fn subscription(
+                &self,
+                state: &Self::State,
+            ) -> iced_futures::Subscription<Self::Message> {
                 self.program.subscription(state)
             }
 
@@ -282,7 +291,7 @@ mod pattern {
             fn name() -> &'static str {
                 P::name()
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -299,7 +308,7 @@ mod pattern {
 
     pub fn with_subscription<P: Program>(
         program: P,
-        f: impl Fn(&P::State) -> iced::Subscription<P::Message>,
+        f: impl Fn(&P::State) -> iced_futures::Subscription<P::Message>,
     ) -> impl Program<State = P::State, Message = P::Message, Theme = P::Theme> {
         struct WithSubscription<P, F> {
             program: P,
@@ -308,7 +317,7 @@ mod pattern {
 
         impl<P: Program, F> Program for WithSubscription<P, F>
         where
-            F: Fn(&P::State) -> iced::Subscription<P::Message>,
+            F: Fn(&P::State) -> iced_futures::Subscription<P::Message>,
         {
             type State = P::State;
             type Message = P::Message;
@@ -316,7 +325,10 @@ mod pattern {
             type Renderer = P::Renderer;
             type Executor = P::Executor;
 
-            fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+            fn subscription(
+                &self,
+                state: &Self::State,
+            ) -> iced_futures::Subscription<Self::Message> {
                 (self.subscription)(state)
             }
 
@@ -356,7 +368,7 @@ mod pattern {
             fn name() -> &'static str {
                 P::name()
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -417,7 +429,10 @@ mod pattern {
                 self.program.view(state, window)
             }
 
-            fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+            fn subscription(
+                &self,
+                state: &Self::State,
+            ) -> iced_futures::Subscription<Self::Message> {
                 self.program.subscription(state)
             }
 
@@ -431,7 +446,7 @@ mod pattern {
             fn name() -> &'static str {
                 P::name()
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -484,7 +499,10 @@ mod pattern {
                 self.program.view(state, window)
             }
 
-            fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+            fn subscription(
+                &self,
+                state: &Self::State,
+            ) -> iced_futures::Subscription<Self::Message> {
                 self.program.subscription(state)
             }
 
@@ -502,7 +520,7 @@ mod pattern {
             fn name() -> &'static str {
                 P::name()
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -551,7 +569,10 @@ mod pattern {
                 self.program.view(state, window)
             }
 
-            fn subscription(&self, state: &Self::State) -> iced::Subscription<Self::Message> {
+            fn subscription(
+                &self,
+                state: &Self::State,
+            ) -> iced_futures::Subscription<Self::Message> {
                 self.program.subscription(state)
             }
 
@@ -573,7 +594,7 @@ mod pattern {
             fn name() -> &'static str {
                 P::name()
             }
-            fn settings(&self) -> iced::Settings {
+            fn settings(&self) -> iced_core::Settings {
                 Default::default()
             }
 
@@ -617,6 +638,7 @@ mod pattern {
                 } else {
                     None
                 },
+                ..Default::default()
             };
             crate::multi_window::run(program, settings, renderer_settings)
         }
@@ -654,10 +676,13 @@ mod pattern {
         }
 
         /// set the default_text_size
-        pub fn default_text_size(self, default_text_size: iced::Pixels) -> Self {
+        pub fn default_text_size<Pixels: Into<iced_core::Pixels>>(
+            self,
+            default_text_size: Pixels,
+        ) -> Self {
             Self {
                 settings: Settings {
-                    default_text_size,
+                    default_text_size: default_text_size.into(),
                     ..self.settings
                 },
                 ..self
@@ -678,7 +703,7 @@ mod pattern {
         /// Sets the subscription logic of the [`Application`].
         pub fn subscription(
             self,
-            f: impl Fn(&P::State) -> iced::Subscription<P::Message>,
+            f: impl Fn(&P::State) -> iced_futures::Subscription<P::Message>,
         ) -> Application<impl Program<State = P::State, Message = P::Message, Theme = P::Theme>>
         {
             Application {

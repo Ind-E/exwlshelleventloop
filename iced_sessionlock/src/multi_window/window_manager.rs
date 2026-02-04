@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use super::state::State;
 use crate::DefaultStyle;
-use iced::mouse;
-use iced::window::Id as IcedId;
+use iced_core::mouse;
+use iced_core::window::Id as IcedId;
 use iced_graphics::Compositor;
 use iced_program::Instance;
 use iced_program::Program;
@@ -56,7 +56,18 @@ where
             entries: BTreeMap::new(),
         }
     }
-
+    pub fn remove(&mut self, id: IcedId) {
+        let remove_alias = self
+            .aliases
+            .iter()
+            .find(|(_, oriid)| **oriid == id)
+            .map(|(layid, _)| *layid);
+        if let Some(oriid) = remove_alias {
+            self.aliases.remove(&oriid);
+        }
+        self.back_aliases.remove(&id);
+        self.entries.remove(&id);
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
@@ -66,7 +77,7 @@ where
         window: Arc<WindowWrapper>,
         application: &Instance<P>,
         compositor: &mut C,
-        system_theme: iced::theme::Mode,
+        system_theme: iced_core::theme::Mode,
     ) -> &mut Window<P, C> {
         let layerid = window.id();
         let state = State::new(id, application, size, fractal_scale, &window, system_theme);
@@ -108,7 +119,11 @@ where
         Some((id, self.get_mut(id)?))
     }
 
-    pub fn get_iced_id(&self, id: IcedId) -> Option<SessionId> {
+    pub fn get_iced_id(&self, id: SessionId) -> Option<IcedId> {
+        self.aliases.get(&id).copied()
+    }
+
+    pub fn get_session_id(&self, id: IcedId) -> Option<SessionId> {
         self.back_aliases.get(&id).copied()
     }
 

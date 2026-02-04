@@ -129,6 +129,7 @@ pub use events::{
 
 use strtoshape::str_to_shape;
 
+use waycrate_xkbkeycode::xkb_keyboard::ElementState;
 use waycrate_xkbkeycode::xkb_keyboard::RepeatInfo;
 
 use wayland_client::{
@@ -208,17 +209,14 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 
 pub use calloop;
 use calloop::{
-    Error as CallLoopError, EventLoop, LoopHandle,
+    Error as CallLoopError, EventLoop, LoopHandle, RegistrationToken,
+    channel::{self, Channel},
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::RecvTimeoutError;
+
 use std::time::Duration;
 use std::time::Instant;
 
@@ -818,6 +816,21 @@ pub enum ImePurpose {
     Terminal,
 }
 
+#[derive(Debug)]
+struct KeyboardTokenState {
+    delay: Duration,
+    key: u32,
+    surface_id: Option<id::Id>,
+    pressed_state: ElementState,
+}
+
+#[derive(Debug)]
+pub struct VirtualKeyRelease {
+    pub delay: Duration,
+    pub time: u32,
+    pub key: u32,
+}
+
 /// main state, store the main information
 #[derive(Debug)]
 pub struct WindowState<T> {
@@ -861,7 +874,11 @@ pub struct WindowState<T> {
 
     // settings
     use_display_handle: bool,
-    loop_handler: Option<LoopHandle<'static, Self>>,
+    repeat_delay: Option<KeyboardTokenState>,
+    to_remove_tokens: Vec<RegistrationToken>,
+    closed_ids: Vec<id::Id>,
+
+    to_be_released_key: Option<VirtualKeyRelease>,
 
     last_unit_index: usize,
     last_wloutput: Option<WlOutput>,
@@ -1339,7 +1356,10 @@ impl<T> Default for WindowState<T> {
             margin: None,
 
             use_display_handle: false,
-            loop_handler: None,
+            repeat_delay: None,
+            to_remove_tokens: Vec::new(),
+            to_be_released_key: None,
+            closed_ids: Vec::new(),
 
             last_wloutput: None,
             last_unit_index: 0,
@@ -1377,9 +1397,8 @@ impl<T> WindowState<T> {
         self.virtual_keyboard.as_ref()
     }
 
-    /// with loop_handler you can do more thing
-    pub fn get_loop_handler(&self) -> Option<&LoopHandle<'static, Self>> {
-        self.loop_handler.as_ref()
+    pub fn set_virtual_key_release(&mut self, key_info: VirtualKeyRelease) {
+        self.to_be_released_key = Some(key_info);
     }
 
     /// use [id::Id] to get the mut [WindowStateUnit]
@@ -1509,8 +1528,20 @@ impl<T: 'static> Dispatch<wl_registry::WlRegistry, ()> for WindowState<T> {
                 {
                     state.last_wloutput.take();
                 }
-                state.outputs.retain(|x| x.0 != name);
-                state.units.retain(|unit| unit.wl_surface.is_alive());
+
+                let outputs_removed = state.outputs.extract_if(.., |o| o.0 == name);
+                for output_removed in outputs_removed {
+                    state
+                        .xdg_info_cache
+                        .retain(|info| info.0.id() != output_removed.1.id());
+                }
+
+                let removed_states = state
+                    .units
+                    .extract_if(.., |unit| !unit.wl_surface.is_alive());
+                for deleled in removed_states.into_iter() {
+                    state.closed_ids.push(deleled.id);
+                }
             }
 
             _ => {}
@@ -1539,7 +1570,7 @@ impl<T: 'static> Dispatch<wl_seat::WlSeat, ()> for WindowState<T> {
                 } else {
                     keyboard_installing = false;
                     let keyboard = state.keyboard_state.take().unwrap();
-                    drop(keyboard);
+                    state.keyboard_state = Some(keyboard.update(seat, qh, ()));
                     if let Some(surface_id) = state.current_surface_id() {
                         state
                             .message
@@ -1552,7 +1583,9 @@ impl<T: 'static> Dispatch<wl_seat::WlSeat, ()> for WindowState<T> {
                     state.pointer = Some(seat.get_pointer(qh, ()));
                 } else {
                     let pointer = state.pointer.take().unwrap();
-                    pointer.release();
+                    if pointer.version() >= 3 {
+                        pointer.release();
+                    }
                 }
             }
             if capabilities.contains(wl_seat::Capability::Touch) {
@@ -1587,13 +1620,18 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        if state.keyboard_state.is_none() {
+            return;
+        }
+
         use keyboard::*;
         use xkb_keyboard::ElementState;
         let surface_id = state.current_surface_id();
-        let keyboard_state = state.keyboard_state.as_mut().unwrap();
+
         match event {
             wl_keyboard::Event::Keymap { format, fd, size } => match format {
                 WEnum::Value(KeymapFormat::XkbV1) => {
+                    let keyboard_state = state.keyboard_state.as_mut().unwrap();
                     let context = &mut keyboard_state.xkb_context;
                     context.set_keymap_from_fd(fd, size as usize)
                 }
@@ -1602,15 +1640,15 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 }
                 _ => unreachable!(),
             },
-            wl_keyboard::Event::Enter { .. } => {
-                if let (Some(token), Some(loop_handle)) = (
-                    keyboard_state.repeat_token.take(),
-                    state.loop_handler.as_ref(),
-                ) {
-                    loop_handle.remove(token);
+            wl_keyboard::Event::Enter { surface, .. } => {
+                state.update_current_surface(Some(surface));
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
+                if let Some(token) = keyboard_state.repeat_token.take() {
+                    state.to_remove_tokens.push(token);
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 keyboard_state.current_repeat = None;
                 state.message.push((
                     surface_id,
@@ -1619,11 +1657,9 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 state
                     .message
                     .push((surface_id, DispatchMessageInner::Unfocus));
-                if let (Some(token), Some(loop_handle)) = (
-                    keyboard_state.repeat_token.take(),
-                    state.loop_handler.as_ref(),
-                ) {
-                    loop_handle.remove(token);
+
+                if let Some(token) = keyboard_state.repeat_token.take() {
+                    state.to_remove_tokens.push(token);
                 }
             }
             wl_keyboard::Event::Key {
@@ -1638,6 +1674,7 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                         return;
                     }
                 };
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 let key = key + 8;
                 if let Some(mut key_context) = keyboard_state.xkb_context.key_context() {
                     let event = key_context.process_key_event(key, pressed_state, false);
@@ -1665,52 +1702,15 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
 
                         keyboard_state.current_repeat = Some(key);
 
-                        if let (Some(token), Some(loop_handle)) = (
-                            keyboard_state.repeat_token.take(),
-                            state.loop_handler.as_ref(),
-                        ) {
-                            loop_handle.remove(token);
+                        if let Some(token) = keyboard_state.repeat_token.take() {
+                            state.to_remove_tokens.push(token);
                         }
-                        let timer = Timer::from_duration(delay);
-
-                        if let Some(looph) = state.loop_handler.as_ref() {
-                            keyboard_state.repeat_token = looph
-                                .insert_source(timer, move |_, _, state| {
-                                    let keyboard_state = match state.keyboard_state.as_mut() {
-                                        Some(keyboard_state) => keyboard_state,
-                                        None => return TimeoutAction::Drop,
-                                    };
-                                    let repeat_keycode = match keyboard_state.current_repeat {
-                                        Some(repeat_keycode) => repeat_keycode,
-                                        None => return TimeoutAction::Drop,
-                                    };
-                                    // NOTE: not the same key
-                                    if repeat_keycode != key {
-                                        return TimeoutAction::Drop;
-                                    }
-                                    if let Some(mut key_context) =
-                                        keyboard_state.xkb_context.key_context()
-                                    {
-                                        let event = key_context.process_key_event(
-                                            repeat_keycode,
-                                            pressed_state,
-                                            false,
-                                        );
-                                        let event = DispatchMessageInner::KeyboardInput {
-                                            event,
-                                            is_synthetic: false,
-                                        };
-                                        state.message.push((surface_id, event));
-                                    }
-                                    match keyboard_state.repeat_info {
-                                        RepeatInfo::Repeat { gap, .. } => {
-                                            TimeoutAction::ToDuration(gap)
-                                        }
-                                        RepeatInfo::Disable => TimeoutAction::Drop,
-                                    }
-                                })
-                                .ok();
-                        }
+                        state.repeat_delay = Some(KeyboardTokenState {
+                            delay,
+                            key,
+                            surface_id,
+                            pressed_state,
+                        });
                     }
                     ElementState::Released => {
                         if keyboard_state.repeat_info != RepeatInfo::Disable
@@ -1721,11 +1721,9 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                             && Some(key) == keyboard_state.current_repeat
                         {
                             keyboard_state.current_repeat = None;
-                            if let (Some(token), Some(loop_handle)) = (
-                                keyboard_state.repeat_token.take(),
-                                state.loop_handler.as_ref(),
-                            ) {
-                                loop_handle.remove(token);
+
+                            if let Some(token) = keyboard_state.repeat_token.take() {
+                                state.to_remove_tokens.push(token);
                             }
                         }
                     }
@@ -1738,6 +1736,7 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 group,
                 ..
             } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 let xkb_context = &mut keyboard_state.xkb_context;
                 let xkb_state = match xkb_context.state_mut() {
                     Some(state) => state,
@@ -1752,14 +1751,13 @@ impl<T> Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState<T> {
                 ))
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                let keyboard_state = state.keyboard_state.as_mut().unwrap();
                 keyboard_state.repeat_info = if rate == 0 {
                     // Stop the repeat once we get a disable event.
                     keyboard_state.current_repeat = None;
-                    if let (Some(token), Some(loop_handle)) = (
-                        keyboard_state.repeat_token.take(),
-                        state.loop_handler.as_ref(),
-                    ) {
-                        loop_handle.remove(token);
+
+                    if let Some(token) = keyboard_state.repeat_token.take() {
+                        state.to_remove_tokens.push(token);
                     }
                     RepeatInfo::Disable
                 } else {
@@ -2184,14 +2182,11 @@ impl<T> Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for WindowState<T> {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if state.is_with_target() && !state.init_finished {
-            let Some((_, xdg_info)) = state
-                .xdg_info_cache
-                .iter_mut()
-                .find(|(_, info)| info.zxdgoutput == *proxy)
-            else {
-                return;
-            };
+        if let Some((_, xdg_info)) = state
+            .xdg_info_cache
+            .iter_mut()
+            .find(|(_, info)| info.zxdgoutput == *proxy)
+        {
             match event {
                 zxdg_output_v1::Event::LogicalSize { width, height } => {
                     xdg_info.logical_size = (width, height);
@@ -2199,16 +2194,16 @@ impl<T> Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for WindowState<T> {
                 zxdg_output_v1::Event::LogicalPosition { x, y } => {
                     xdg_info.position = (x, y);
                 }
-                zxdg_output_v1::Event::Name { name } => {
-                    xdg_info.name = name;
+                zxdg_output_v1::Event::Name { ref name } => {
+                    xdg_info.name = name.clone();
                 }
-                zxdg_output_v1::Event::Description { description } => {
-                    xdg_info.description = description;
+                zxdg_output_v1::Event::Description { ref description } => {
+                    xdg_info.description = description.clone();
                 }
                 _ => {}
             };
-            return;
         }
+
         let Some(index) = state.units.iter().position(|info| {
             info.zxdgoutput
                 .as_ref()
@@ -2509,6 +2504,12 @@ impl<T: 'static> WindowState<T> {
 
         // do the step before, you get empty list
 
+        for (_, output_display) in &self.outputs {
+            let zxdgoutput = xdg_output_manager.get_xdg_output(output_display, &qh, ());
+            self.xdg_info_cache
+                .push((output_display.clone(), ZxdgOutputInfo::new(zxdgoutput)));
+        }
+        event_queue.blocking_dispatch(&mut self)?; // then make a dispatch
         // so it is the same way, to get surface detach to protocol, first get the shell, like wmbase
         // or layer_shell or session-shell, then get `surface` from the wl_surface you get before, and
         // set it
@@ -2528,12 +2529,6 @@ impl<T: 'static> WindowState<T> {
 
             let (binded_output, binded_xdginfo) = match self.start_mode.clone() {
                 StartMode::TargetScreen(name) => {
-                    for (_, output_display) in &self.outputs {
-                        let zxdgoutput = xdg_output_manager.get_xdg_output(output_display, &qh, ());
-                        self.xdg_info_cache
-                            .push((output_display.clone(), ZxdgOutputInfo::new(zxdgoutput)));
-                    }
-                    event_queue.blocking_dispatch(&mut self)?; // then make a dispatch
                     if let Some(cache) = self
                         .xdg_info_cache
                         .iter()
@@ -2542,7 +2537,6 @@ impl<T: 'static> WindowState<T> {
                     {
                         output = Some(cache.clone());
                     }
-                    self.xdg_info_cache.clear();
                     let binded_output = output.as_ref().map(|(output, _)| output).cloned();
                     let binded_xdginfo = output.as_ref().map(|(_, xdginfo)| xdginfo).cloned();
                     (binded_output, binded_xdginfo)
@@ -2698,7 +2692,7 @@ impl<T: 'static> WindowState<T> {
     /// Different with running, it receiver a receiver
     pub fn running_with_proxy<F, Message>(
         self,
-        message_receiver: std::sync::mpsc::Receiver<Message>,
+        message_receiver: Channel<Message>,
         event_handler: F,
     ) -> Result<(), LayerEventError>
     where
@@ -2724,7 +2718,7 @@ impl<T: 'static> WindowState<T> {
 
     fn running_with_proxy_option<F, Message>(
         mut self,
-        message_receiver: Option<std::sync::mpsc::Receiver<Message>>,
+        message_receiver: Option<Channel<Message>>,
         mut event_handler: F,
     ) -> Result<(), LayerEventError>
     where
@@ -2733,8 +2727,8 @@ impl<T: 'static> WindowState<T> {
             + 'static,
     {
         let globals = self.globals.take().unwrap();
-        let event_queue = self.event_queue.take().unwrap();
-        let qh = event_queue.handle();
+        let mut event_queue_origin = self.event_queue.take().unwrap();
+        let qh = event_queue_origin.handle();
         let wmcompositer = self.wl_compositor.take().unwrap();
         let shm = self.shm.take().unwrap();
         let fractional_scale_manager = self.fractional_scale_manager.take();
@@ -2777,432 +2771,195 @@ impl<T: 'static> WindowState<T> {
             }
         }
 
-        let mut event_loop: EventLoop<Self> =
+        struct EventWrapper<Raw, F> {
+            raw: Raw,
+            fun: F,
+            loop_handle: LoopHandle<'static, Self>,
+        }
+
+        let mut event_loop: EventLoop<_> =
             EventLoop::try_new().expect("Failed to initialize the event loop");
 
+        let event_queue = connection.new_event_queue::<EventWrapper<Self, F>>();
         WaylandSource::new(connection.clone(), event_queue)
             .insert(event_loop.handle())
             .expect("Failed to init wayland source");
+        let mut state = EventWrapper {
+            raw: self,
+            fun: event_handler,
+            loop_handle: event_loop.handle(),
+        };
+        let signal = event_loop.get_signal();
 
-        self.loop_handler = Some(event_loop.handle());
+        if let Some(channel) = message_receiver {
+            event_loop
+                .handle()
+                .insert_source(channel, |event, _, r_window_state| {
+                    let channel::Event::Msg(event) = event else {
+                        return;
+                    };
+                    let window_state = &mut r_window_state.raw;
+                    let event_handler = &mut r_window_state.fun;
+                    window_state.handle_event(
+                        &mut *event_handler,
+                        LayerShellEvent::UserEvent(event),
+                        None,
+                    );
+                })
+                .expect("We need message state");
+        }
 
-        let to_exit = Arc::new(AtomicBool::new(false));
-
-        let events: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let thread = std::thread::spawn({
-            let events = events.clone();
-            let to_exit = to_exit.clone();
-            move || {
-                let Some(message_receiver) = message_receiver else {
-                    return;
-                };
-                loop {
-                    let message = message_receiver.recv_timeout(Duration::from_millis(100));
-                    if to_exit.load(Ordering::Relaxed) {
-                        break;
+        let process_window_state = |window_state: &mut WindowState<T>, event_handler: &mut F| {
+            let mut messages = Vec::new();
+            std::mem::swap(&mut messages, &mut window_state.message);
+            for msg in messages.iter() {
+                match msg {
+                    (index_info, DispatchMessageInner::XdgInfoChanged(change_type)) => {
+                        window_state.handle_event(
+                            &mut *event_handler,
+                            LayerShellEvent::XdgInfoChanged(*change_type),
+                            *index_info,
+                        );
                     }
-                    match message {
-                        Ok(message) => {
-                            let mut events_local = events.lock().unwrap();
-                            events_local.push(message);
+                    (_, DispatchMessageInner::NewDisplay(output_display)) => {
+                        let zxdgoutput = xdg_output_manager.get_xdg_output(output_display, &qh, ());
+
+                        window_state.xdg_info_cache.push((
+                            output_display.clone(),
+                            ZxdgOutputInfo::new(zxdgoutput.clone()),
+                        ));
+                        if !window_state.is_allscreens() {
+                            continue;
                         }
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break;
+                        let wl_surface = wmcompositer.create_surface(&qh, ());
+                        let layer_shell = globals
+                            .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
+                            .unwrap();
+                        let layer = layer_shell.get_layer_surface(
+                            &wl_surface,
+                            Some(output_display),
+                            window_state.layer,
+                            window_state.namespace.clone(),
+                            &qh,
+                            (),
+                        );
+                        layer.set_anchor(window_state.anchor);
+                        layer.set_keyboard_interactivity(window_state.keyboard_interactivity);
+                        if let Some((init_w, init_h)) = window_state.size {
+                            layer.set_size(init_w, init_h);
                         }
+
+                        if let Some(zone) = window_state.exclusive_zone {
+                            layer.set_exclusive_zone(zone);
+                        }
+
+                        if let Some((top, right, bottom, left)) = window_state.margin {
+                            layer.set_margin(top, right, bottom, left);
+                        }
+
+                        if window_state.events_transparent {
+                            let region = wmcompositer.create_region(&qh, ());
+                            wl_surface.set_input_region(Some(&region));
+                            region.destroy();
+                        }
+                        wl_surface.commit();
+
+                        let mut fractional_scale = None;
+                        if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                            fractional_scale = Some(fractional_scale_manager.get_fractional_scale(
+                                &wl_surface,
+                                &qh,
+                                (),
+                            ));
+                        }
+                        let viewport = viewporter
+                            .as_ref()
+                            .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+
+                        window_state.push_window(
+                            WindowStateUnitBuilder::new(
+                                id::Id::unique(),
+                                qh.clone(),
+                                connection.display(),
+                                wl_surface,
+                                Shell::LayerShell(layer),
+                            )
+                            .viewport(viewport)
+                            .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
+                            .fractional_scale(fractional_scale)
+                            .wl_output(Some(output_display.clone()))
+                            .build(),
+                        );
+                    }
+                    _ => {
+                        let (index_message, msg) = msg;
+
+                        let msg: DispatchMessage = msg.clone().into();
+                        window_state.handle_event(
+                            &mut *event_handler,
+                            LayerShellEvent::RequestMessages(&msg),
+                            *index_message,
+                        );
                     }
                 }
             }
-        });
 
-        let signal = event_loop.get_signal();
-        event_loop
-            .handle()
-            .insert_source(
-                Timer::from_duration(Duration::from_millis(50)),
-                move |_, _, window_state| {
-                    let mut messages = Vec::new();
-                    std::mem::swap(&mut messages, &mut window_state.message);
-                    for msg in messages.iter() {
-                        match msg {
-                            (index_info, DispatchMessageInner::XdgInfoChanged(change_type)) => {
-                                window_state.handle_event(
-                                    &mut event_handler,
-                                    LayerShellEvent::XdgInfoChanged(*change_type),
-                                    *index_info,
-                                );
-                            }
-                            (_, DispatchMessageInner::NewDisplay(output_display)) => {
-                                if !window_state.is_allscreens() {
-                                    continue;
-                                }
-                                let wl_surface = wmcompositer.create_surface(&qh, ()); // and create a surface. if two or more,
-                                let layer_shell = globals
-                                    .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
-                                    .unwrap();
-                                let layer = layer_shell.get_layer_surface(
-                                    &wl_surface,
-                                    Some(output_display),
-                                    window_state.layer,
-                                    window_state.namespace.clone(),
-                                    &qh,
-                                    (),
-                                );
-                                layer.set_anchor(window_state.anchor);
-                                layer
-                                    .set_keyboard_interactivity(window_state.keyboard_interactivity);
-                                if let Some((init_w, init_h)) = window_state.size {
-                                    layer.set_size(init_w, init_h);
-                                }
+            window_state.handle_event(&mut *event_handler, LayerShellEvent::NormalDispatch, None);
+            loop {
+                let mut return_data = vec![];
+                std::mem::swap(&mut window_state.return_data, &mut return_data);
 
-                                if let Some(zone) = window_state.exclusive_zone {
-                                    layer.set_exclusive_zone(zone);
-                                }
-
-                                if let Some((top, right, bottom, left)) = window_state.margin {
-                                    layer.set_margin(top, right, bottom, left);
-                                }
-
-                                if window_state.events_transparent {
-                                    let region = wmcompositer.create_region(&qh, ());
-                                    wl_surface.set_input_region(Some(&region));
-                                    region.destroy();
-                                }
-                                wl_surface.commit();
-
-                                let zxdgoutput =
-                                    xdg_output_manager.get_xdg_output(output_display, &qh, ());
-                                let mut fractional_scale = None;
-                                if let Some(ref fractional_scale_manager) = fractional_scale_manager
-                                {
-                                    fractional_scale =
-                                        Some(fractional_scale_manager.get_fractional_scale(
-                                            &wl_surface,
-                                            &qh,
-                                            (),
-                                        ));
-                                }
-                                let viewport = viewporter
-                                    .as_ref()
-                                    .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
-                                // so during the init Configure of the shell, a buffer, atleast a buffer is needed.
-                                // and if you need to reconfigure it, you need to commit the wl_surface again
-                                // so because this is just an example, so we just commit it once
-                                // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
-
-                                window_state.push_window(
-                                    WindowStateUnitBuilder::new(
-                                        id::Id::unique(),
-                                        qh.clone(),
-                                        connection.display(),
-                                        wl_surface,
-                                        Shell::LayerShell(layer),
-                                    )
-                                    .viewport(viewport)
-                                    .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
-                                    .fractional_scale(fractional_scale)
-                                    .wl_output(Some(output_display.clone()))
-                                    .build(),
-                                );
-                            }
-                            _ => {
-                                let (index_message, msg) = msg;
-
-                                let msg: DispatchMessage = msg.clone().into();
-                                window_state.handle_event(
-                                    &mut event_handler,
-                                    LayerShellEvent::RequestMessages(&msg),
-                                    *index_message,
-                                );
-                            }
+                for data in return_data {
+                    match data {
+                        ReturnData::RequestExit => {
+                            signal.stop();
+                            return true;
                         }
-                    }
-
-                    let mut local_events = events.lock().expect(
-                        "This events only used in this callback, so it should always can be unlocked",
-                    );
-                    let mut swapped_events: Vec<Message> = vec![];
-                    std::mem::swap(&mut *local_events, &mut swapped_events);
-                    drop(local_events);
-                    for event in swapped_events {
-                        window_state.handle_event(&mut event_handler, LayerShellEvent::UserEvent(event), None);
-                    }
-                    window_state.handle_event(&mut event_handler, LayerShellEvent::NormalDispatch, None);
-                    loop {
-                        let mut return_data = vec![];
-                        std::mem::swap(&mut window_state.return_data, &mut return_data);
-
-                        for data in return_data {
-                            match data {
-                                ReturnData::RequestExit => {
-                                    signal.stop();
-                                    return TimeoutAction::Drop;
-                                }
-                                ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
-                                    let Some(serial) = window_state.enter_serial else {
-                                        continue;
-                                    };
-                                    set_cursor_shape(
-                                        &cursor_update_context,
-                                        shape_name,
-                                        pointer,
-                                        serial,
-                                    );
-                                }
-                                ReturnData::NewLayerShell((
-                                    NewLayerShellSettings {
-                                        size,
-                                        layer,
-                                        anchor,
-                                        exclusive_zone,
-                                        margin,
-                                        keyboard_interactivity,
-                                        output_option: output_type,
-                                        events_transparent,
-                                        namespace,
-                                    },
-                                    id,
-                                    info,
-                                )) => {
-                                    let output = match output_type {
-                                        OutputOption::Output(output) => Some(output),
-                                        _ => {
-                                            let pos = window_state.surface_pos();
-
-                                            let mut output =
-                                                pos.and_then(|p| window_state.units[p].wl_output.as_ref());
-
-                                            if window_state.last_wloutput.is_none()
-                                                && window_state.outputs.len() > window_state.last_unit_index
-                                            {
-                                                window_state.last_wloutput = Some(
-                                                    window_state.outputs[window_state.last_unit_index]
-                                                        .1
-                                                        .clone(),
-                                                );
-                                            }
-
-                                            if matches!(output_type, events::OutputOption::LastOutput) {
-                                                output = window_state.last_wloutput.as_ref();
-                                            }
-
-                                            output.cloned()
-                                        }
-                                    };
-
-
-                                    let wl_surface = wmcompositer.create_surface(&qh, ()); // and create a surface. if two or more,
-                                    let layer_shell = globals
-                                        .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
-                                        .unwrap();
-                                    let layer = layer_shell.get_layer_surface(
-                                        &wl_surface,
-                                        output.as_ref(),
-                                        layer,
-                                        namespace.unwrap_or_else(|| window_state.namespace.clone()),
-                                        &qh,
-                                        (),
-                                    );
-                                    layer.set_anchor(anchor);
-                                    layer.set_keyboard_interactivity(keyboard_interactivity);
-                                    if let Some((init_w, init_h)) = size {
-                                        layer.set_size(init_w, init_h);
-                                    }
-
-                                    if let Some(zone) = exclusive_zone {
-                                        layer.set_exclusive_zone(zone);
-                                    }
-
-                                    if let Some((top, right, bottom, left)) = margin {
-                                        layer.set_margin(top, right, bottom, left);
-                                    }
-
-                                    if events_transparent {
-                                        let region = wmcompositer.create_region(&qh, ());
-                                        wl_surface.set_input_region(Some(&region));
-                                        region.destroy();
-                                    }
-
-                                    wl_surface.commit();
-
-                                    let mut fractional_scale = None;
-                                    if let Some(ref fractional_scale_manager) =
-                                        fractional_scale_manager
-                                    {
-                                        fractional_scale =
-                                            Some(fractional_scale_manager.get_fractional_scale(
-                                                &wl_surface,
-                                                &qh,
-                                                (),
-                                            ));
-                                    }
-                                    let viewport = viewporter.as_ref().map(|viewport| {
-                                        viewport.get_viewport(&wl_surface, &qh, ())
-                                    });
-                                    // so during the init Configure of the shell, a buffer, atleast a buffer is needed.
-                                    // and if you need to reconfigure it, you need to commit the wl_surface again
-                                    // so because this is just an example, so we just commit it once
-                                    // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
-
-                                    window_state.push_window(
-                                        WindowStateUnitBuilder::new(
-                                            id,
-                                            qh.clone(),
-                                            connection.display(),
-                                            wl_surface,
-                                            Shell::LayerShell(layer),
-                                        )
-                                        .viewport(viewport)
-                                        .fractional_scale(fractional_scale)
-                                        .wl_output(output)
-                                        .binding(info)
-                                        .becreated(true)
-                                        .build(),
-                                    );
-                                }
-                                ReturnData::NewPopUp((
-                                    NewPopUpSettings {
-                                        size: (width, height),
-                                        position: (x, y),
-                                        id,
-                                    },
-                                    targetid,
-                                    info,
-                                )) => {
-                                    let Some(index) = window_state
-                                        .units
-                                        .iter()
-                                        .position(|unit| !unit.is_popup() && unit.id == id)
-                                    else {
-                                        continue;
-                                    };
-                                    let wl_surface = wmcompositer.create_surface(&qh, ());
-                                    let positioner = wmbase.create_positioner(&qh, ());
-                                    positioner.set_size(width as i32, height as i32);
-                                    positioner.set_anchor_rect(x, y, width as i32, height as i32);
-                                    let wl_xdg_surface =
-                                        wmbase.get_xdg_surface(&wl_surface, &qh, ());
-                                    let popup =
-                                        wl_xdg_surface.get_popup(None, &positioner, &qh, ());
-
-                                    let Shell::LayerShell(shell) = &window_state.units[index].shell
-                                    else {
-                                        unreachable!()
-                                    };
-                                    shell.get_popup(&popup);
-
-                                    let mut fractional_scale = None;
-                                    if let Some(ref fractional_scale_manager) =
-                                        fractional_scale_manager
-                                    {
-                                        fractional_scale =
-                                            Some(fractional_scale_manager.get_fractional_scale(
-                                                &wl_surface,
-                                                &qh,
-                                                (),
-                                            ));
-                                    }
-                                    wl_surface.commit();
-
-                                    let viewport = viewporter.as_ref().map(|viewport| {
-                                        viewport.get_viewport(&wl_surface, &qh, ())
-                                    });
-                                    window_state.push_window(
-                                        WindowStateUnitBuilder::new(
-                                            targetid,
-                                            qh.clone(),
-                                            connection.display(),
-                                            wl_surface,
-                                            Shell::PopUp((popup, wl_xdg_surface)),
-                                        )
-                                        .size((width, height))
-                                        .viewport(viewport)
-                                        .fractional_scale(fractional_scale)
-                                        .binding(info)
-                                        .becreated(true)
-                                        .build(),
-                                    );
-                                },
-                                ReturnData::NewXdgBase((
-                                    NewXdgWindowSettings{
-                                        title,
-                                        size
-                                    },
-                                    id,
-                                    info,
-                                )) => {
-                                    let wl_surface = wmcompositer.create_surface(&qh, ());
-                                    let wl_xdg_surface =
-                                        wmbase.get_xdg_surface(&wl_surface, &qh, ());
-                                    let toplevel =
-                                        wl_xdg_surface.get_toplevel(&qh, ());
-
-                                    toplevel.set_title(title.unwrap_or("".to_owned()));
-
-                                    let decoration = if let Some(decoration_manager) = &zxdg_decoration_manager {
-                                        let decoration = decoration_manager.get_toplevel_decoration(&toplevel, &qh, ());
-                                        use zxdg_toplevel_decoration_v1::Mode;
-                                        decoration.set_mode(Mode::ServerSide);
-                                        Some(decoration)
-
-                                    } else {
-                                        None
-                                    };
-                                    let mut fractional_scale = None;
-                                    if let Some(ref fractional_scale_manager) =
-                                        fractional_scale_manager
-                                    {
-                                        fractional_scale =
-                                            Some(fractional_scale_manager.get_fractional_scale(
-                                                &wl_surface,
-                                                &qh,
-                                                (),
-                                            ));
-                                    }
-                                    wl_surface.commit();
-
-                                    let viewport = viewporter.as_ref().map(|viewport| {
-                                        viewport.get_viewport(&wl_surface, &qh, ())
-                                    });
-                                    window_state.push_window(
-                                        WindowStateUnitBuilder::new(
-                                            id,
-                                            qh.clone(),
-                                            connection.display(),
-                                            wl_surface,
-                                            Shell::XdgTopLevel((toplevel, wl_xdg_surface, decoration)),
-                                        )
-                                        .size(size.unwrap_or((300, 300)))
-                                        .viewport(viewport)
-                                        .fractional_scale(fractional_scale)
-                                        .binding(info)
-                                        .becreated(true)
-                                        .build(),
-                                    );
-                                },
-
-                                ReturnData::NewInputPanel((
-                                    NewInputPanelSettings {
-                                        size: (width, height),
-                                        keyboard,
-                                        use_last_output,
-                                    },
-                                    id,
-                                    info,
-                                )) => {
+                        ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                            let Some(serial) = window_state.enter_serial else {
+                                continue;
+                            };
+                            set_cursor_shape(&cursor_update_context, shape_name, pointer, serial);
+                        }
+                        ReturnData::NewLayerShell((
+                            NewLayerShellSettings {
+                                size,
+                                layer,
+                                anchor,
+                                exclusive_zone,
+                                margin,
+                                keyboard_interactivity,
+                                output_option: output_type,
+                                events_transparent,
+                                namespace,
+                            },
+                            id,
+                            info,
+                        )) => {
+                            let output = match output_type {
+                                OutputOption::Output(output) => Some(output),
+                                OutputOption::OutputName(name) => window_state
+                                    .xdg_info_cache
+                                    .iter()
+                                    .find(|(_, info)| info.name == *name)
+                                    .map(|(output, _)| output.clone()),
+                                _ => {
                                     let pos = window_state.surface_pos();
 
-                                    let mut output = pos.and_then(|p| window_state.units[p].wl_output.as_ref());
+                                    let mut output =
+                                        pos.and_then(|p| window_state.units[p].wl_output.as_ref());
 
                                     if window_state.last_wloutput.is_none()
                                         && window_state.outputs.len() > window_state.last_unit_index
                                     {
-                                        window_state.last_wloutput =
-                                            Some(window_state.outputs[window_state.last_unit_index].1.clone());
+                                        window_state.last_wloutput = Some(
+                                            window_state.outputs[window_state.last_unit_index]
+                                                .1
+                                                .clone(),
+                                        );
                                     }
 
-                                    if use_last_output {
+                                    if matches!(output_type, events::OutputOption::LastOutput) {
                                         output = window_state.last_wloutput.as_ref();
                                     }
 
@@ -3210,138 +2967,441 @@ impl<T: 'static> WindowState<T> {
                                         output = window_state.outputs.first().map(|(_, o)| o);
                                     }
 
-                                    let Some(output) = output else {
-                                        log::warn!("no WlOutput, skip creating input panel");
-                                        continue;
-                                    };
+                                    output.cloned()
+                                }
+                            };
 
-                                    let wl_surface = wmcompositer.create_surface(&qh, ());
-                                    let input_panel = globals
-                                        .bind::<ZwpInputPanelV1, _, _>(&qh, 1..=1, ())
-                                        .unwrap();
-                                    let input_panel_surface =
-                                        input_panel.get_input_panel_surface(&wl_surface, &qh, ());
-                                    if keyboard {
-                                        input_panel_surface.set_toplevel(
-                                            output,
-                                            ZwpInputPanelPosition::CenterBottom as u32,
-                                        );
-                                    } else {
-                                        input_panel_surface.set_overlay_panel();
-                                    }
-                                    wl_surface.commit();
-
-                                    let mut fractional_scale = None;
-                                    if let Some(ref fractional_scale_manager) = fractional_scale_manager {
-                                        fractional_scale =
-                                            Some(fractional_scale_manager.get_fractional_scale(
-                                                &wl_surface,
-                                                &qh,
-                                                (),
-                                            ));
-                                    }
-
-                                    let viewport = viewporter
-                                        .as_ref()
-                                        .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
-                                    window_state.push_window(
-                                        WindowStateUnitBuilder::new(
-                                            id,
-                                            qh.clone(),
-                                            connection.display(),
-                                            wl_surface,
-                                            Shell::InputPanel(input_panel_surface),
-                                        )
-                                        .size((width, height))
-                                        .viewport(viewport)
-                                        .fractional_scale(fractional_scale)
-                                        .binding(info)
-                                        .becreated(true)
-                                        .build(),
-                                    );
-                                },
-                                _ => {}
-                            }
-                        }
-                        if window_state.return_data.is_empty() {
-                            break;
-                        }
-                    }
-
-                    let to_be_closed_ids: Vec<_> = window_state
-                        .units
-                        .iter()
-                        .filter(|unit| unit.request_flag.close)
-                        .map(WindowStateUnit::id)
-                        .collect();
-                    for id in to_be_closed_ids {
-                        window_state.handle_event(
-                            &mut event_handler,
-                            LayerShellEvent::RequestMessages(&DispatchMessage::Closed),
-                            Some(id),
-                        );
-                        // event_handler may use unit, only remove it after calling event_handler.
-                        window_state.remove_shell(id);
-                    }
-
-                    for idx in 0..window_state.units.len() {
-                        let unit = &mut window_state.units[idx];
-                        let (width, height) = unit.size;
-                        if width == 0 || height == 0 {
-                            // don't refresh, if size is 0.
-                            continue;
-                        }
-                        if unit.take_present_slot() {
-                            let unit_id = unit.id;
-                            let is_created = unit.becreated;
-                            let scale_float = unit.scale_float();
-                            let wl_surface = unit.wl_surface.clone();
-                            if unit.buffer.is_none() && !window_state.use_display_handle {
-                                let Ok(mut file) = tempfile::tempfile() else {
-                                    log::error!("Cannot create new file from tempfile");
-                                    return TimeoutAction::Drop;
-                                };
-                                let ReturnData::WlBuffer(buffer) = event_handler(
-                                    LayerShellEvent::RequestBuffer(&mut file, &shm, &qh, width, height),
-                                    window_state,
-                                    Some(unit_id)) else {
-                                    panic!("You cannot return this one");
-                                };
-                                wl_surface.attach(Some(&buffer), 0, 0);
-                                wl_surface.commit();
-                                window_state.units[idx].buffer = Some(buffer);
-                            }
-                            window_state.handle_event(
-                                &mut event_handler,
-                                LayerShellEvent::RequestMessages(&DispatchMessage::RequestRefresh {
-                                    width,
-                                    height,
-                                    is_created,
-                                    scale_float,
-                                }),
-                                Some(unit_id),
+                            let wl_surface = wmcompositer.create_surface(&qh, ());
+                            let layer_shell = globals
+                                .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
+                                .unwrap();
+                            let layer = layer_shell.get_layer_surface(
+                                &wl_surface,
+                                output.as_ref(),
+                                layer,
+                                namespace.unwrap_or_else(|| window_state.namespace.clone()),
+                                &qh,
+                                (),
                             );
-                            // reset if the slot is not used
-                            window_state.units[idx].reset_present_slot();
+                            layer.set_anchor(anchor);
+                            layer.set_keyboard_interactivity(keyboard_interactivity);
+                            if let Some((init_w, init_h)) = size {
+                                layer.set_size(init_w, init_h);
+                            }
+
+                            if let Some(zone) = exclusive_zone {
+                                layer.set_exclusive_zone(zone);
+                            }
+
+                            if let Some((top, right, bottom, left)) = margin {
+                                layer.set_margin(top, right, bottom, left);
+                            }
+
+                            if events_transparent {
+                                let region = wmcompositer.create_region(&qh, ());
+                                wl_surface.set_input_region(Some(&region));
+                                region.destroy();
+                            }
+
+                            wl_surface.commit();
+
+                            let mut fractional_scale = None;
+                            if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                                fractional_scale =
+                                    Some(fractional_scale_manager.get_fractional_scale(
+                                        &wl_surface,
+                                        &qh,
+                                        (),
+                                    ));
+                            }
+                            let viewport = viewporter
+                                .as_ref()
+                                .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+
+                            window_state.push_window(
+                                WindowStateUnitBuilder::new(
+                                    id,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::LayerShell(layer),
+                                )
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .wl_output(output)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
                         }
+                        ReturnData::NewPopUp((
+                            NewPopUpSettings {
+                                size: (width, height),
+                                position: (x, y),
+                                id,
+                            },
+                            targetid,
+                            info,
+                        )) => {
+                            let Some(index) = window_state
+                                .units
+                                .iter()
+                                .position(|unit| !unit.is_popup() && unit.id == id)
+                            else {
+                                continue;
+                            };
+                            let wl_surface = wmcompositer.create_surface(&qh, ());
+                            let positioner = wmbase.create_positioner(&qh, ());
+                            positioner.set_size(width as i32, height as i32);
+                            positioner.set_anchor_rect(x, y, width as i32, height as i32);
+                            let wl_xdg_surface = wmbase.get_xdg_surface(&wl_surface, &qh, ());
+                            let popup = wl_xdg_surface.get_popup(None, &positioner, &qh, ());
+
+                            let Shell::LayerShell(shell) = &window_state.units[index].shell else {
+                                unreachable!()
+                            };
+                            shell.get_popup(&popup);
+
+                            let mut fractional_scale = None;
+                            if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                                fractional_scale =
+                                    Some(fractional_scale_manager.get_fractional_scale(
+                                        &wl_surface,
+                                        &qh,
+                                        (),
+                                    ));
+                            }
+                            wl_surface.commit();
+
+                            let viewport = viewporter
+                                .as_ref()
+                                .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+                            window_state.push_window(
+                                WindowStateUnitBuilder::new(
+                                    targetid,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::PopUp((popup, wl_xdg_surface)),
+                                )
+                                .size((width, height))
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
+                        }
+                        ReturnData::NewXdgBase((
+                            NewXdgWindowSettings { title, size },
+                            id,
+                            info,
+                        )) => {
+                            let wl_surface = wmcompositer.create_surface(&qh, ());
+                            let wl_xdg_surface = wmbase.get_xdg_surface(&wl_surface, &qh, ());
+                            let toplevel = wl_xdg_surface.get_toplevel(&qh, ());
+
+                            toplevel.set_title(title.unwrap_or("".to_owned()));
+
+                            let decoration = if let Some(decoration_manager) =
+                                &zxdg_decoration_manager
+                            {
+                                let decoration =
+                                    decoration_manager.get_toplevel_decoration(&toplevel, &qh, ());
+                                use zxdg_toplevel_decoration_v1::Mode;
+                                decoration.set_mode(Mode::ServerSide);
+                                Some(decoration)
+                            } else {
+                                None
+                            };
+                            let mut fractional_scale = None;
+                            if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                                fractional_scale =
+                                    Some(fractional_scale_manager.get_fractional_scale(
+                                        &wl_surface,
+                                        &qh,
+                                        (),
+                                    ));
+                            }
+                            wl_surface.commit();
+
+                            let viewport = viewporter
+                                .as_ref()
+                                .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+                            window_state.push_window(
+                                WindowStateUnitBuilder::new(
+                                    id,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::XdgTopLevel((toplevel, wl_xdg_surface, decoration)),
+                                )
+                                .size(size.unwrap_or((300, 300)))
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
+                        }
+
+                        ReturnData::NewInputPanel((
+                            NewInputPanelSettings {
+                                size: (width, height),
+                                keyboard,
+                                use_last_output,
+                            },
+                            id,
+                            info,
+                        )) => {
+                            let pos = window_state.surface_pos();
+
+                            let mut output =
+                                pos.and_then(|p| window_state.units[p].wl_output.as_ref());
+
+                            if window_state.last_wloutput.is_none()
+                                && window_state.outputs.len() > window_state.last_unit_index
+                            {
+                                window_state.last_wloutput = Some(
+                                    window_state.outputs[window_state.last_unit_index].1.clone(),
+                                );
+                            }
+
+                            if use_last_output {
+                                output = window_state.last_wloutput.as_ref();
+                            }
+
+                            if output.is_none() {
+                                output = window_state.outputs.first().map(|(_, o)| o);
+                            }
+
+                            let Some(output) = output else {
+                                log::warn!("no WlOutput, skip creating input panel");
+                                continue;
+                            };
+
+                            let wl_surface = wmcompositer.create_surface(&qh, ());
+                            let input_panel = globals
+                                .bind::<ZwpInputPanelV1, _, _>(&qh, 1..=1, ())
+                                .unwrap();
+                            let input_panel_surface =
+                                input_panel.get_input_panel_surface(&wl_surface, &qh, ());
+                            if keyboard {
+                                input_panel_surface.set_toplevel(
+                                    output,
+                                    ZwpInputPanelPosition::CenterBottom as u32,
+                                );
+                            } else {
+                                input_panel_surface.set_overlay_panel();
+                            }
+                            wl_surface.commit();
+
+                            let mut fractional_scale = None;
+                            if let Some(ref fractional_scale_manager) = fractional_scale_manager {
+                                fractional_scale =
+                                    Some(fractional_scale_manager.get_fractional_scale(
+                                        &wl_surface,
+                                        &qh,
+                                        (),
+                                    ));
+                            }
+
+                            let viewport = viewporter
+                                .as_ref()
+                                .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
+                            window_state.push_window(
+                                WindowStateUnitBuilder::new(
+                                    id,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::InputPanel(input_panel_surface),
+                                )
+                                .size((width, height))
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
+                        }
+                        _ => {}
                     }
-                    TimeoutAction::ToDuration(std::time::Duration::from_millis(50))
-                },
-            )
-            .expect("Cannot insert_source");
+                }
+                // added guard to match `sessionlockev`.
+                window_state
+                    .return_data
+                    .retain(|data| !matches!(data, ReturnData::None));
+                if window_state.return_data.is_empty() {
+                    break;
+                }
+            }
+
+            let to_be_closed_ids: Vec<_> = window_state
+                .units
+                .iter()
+                .filter(|unit| unit.request_flag.close)
+                .map(WindowStateUnit::id)
+                .collect();
+            for id in to_be_closed_ids {
+                window_state.handle_event(
+                    &mut *event_handler,
+                    LayerShellEvent::RequestMessages(&DispatchMessage::Closed),
+                    Some(id),
+                );
+                window_state.remove_shell(id);
+            }
+
+            let closed_ids = window_state.closed_ids.clone();
+            for id in closed_ids {
+                window_state.handle_event(
+                    &mut *event_handler,
+                    LayerShellEvent::RequestMessages(&DispatchMessage::Closed),
+                    Some(id),
+                );
+            }
+            window_state.closed_ids.clear();
+
+            for idx in 0..window_state.units.len() {
+                let unit = &mut window_state.units[idx];
+                let (width, height) = unit.size;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                if unit.take_present_slot() {
+                    let unit_id = unit.id;
+                    let is_created = unit.becreated;
+                    let scale_float = unit.scale_float();
+                    let wl_surface = unit.wl_surface.clone();
+                    if unit.buffer.is_none() && !window_state.use_display_handle {
+                        let Ok(mut file) = tempfile::tempfile() else {
+                            log::error!("Cannot create new file from tempfile");
+                            // note: could lead to infinite loop or spam log
+                            // if the error is persistent.
+                            return false;
+                        };
+                        let ReturnData::WlBuffer(buffer) = event_handler(
+                            LayerShellEvent::RequestBuffer(&mut file, &shm, &qh, width, height),
+                            window_state,
+                            Some(unit_id),
+                        ) else {
+                            panic!("You cannot return this one");
+                        };
+                        wl_surface.attach(Some(&buffer), 0, 0);
+                        wl_surface.commit();
+                        window_state.units[idx].buffer = Some(buffer);
+                    }
+                    window_state.handle_event(
+                        &mut *event_handler,
+                        LayerShellEvent::RequestMessages(&DispatchMessage::RequestRefresh {
+                            width,
+                            height,
+                            is_created,
+                            scale_float,
+                        }),
+                        Some(unit_id),
+                    );
+                    window_state.units[idx].reset_present_slot();
+                }
+            }
+
+            false
+        };
         event_loop
             .run(
+                // scheduler now relies on this duration. If no wayland events
+                // are received, At(instant) *could* be serviced up to ~20ms late.
+                // technically an improvement over previous 50ms timer, but
+                // semantically different given event loop callback.
                 std::time::Duration::from_millis(20),
-                &mut self,
-                |_window_state| {
-                    // Finally, this is where you can insert the processing you need
-                    // to do do between each waiting event eg. drawing logic if
-                    // you're doing a GUI app.
+                &mut state,
+                move |r_window_state| {
+                    let window_state = &mut r_window_state.raw;
+                    let _ = event_queue_origin.roundtrip(window_state);
+                    let event_handler = &mut r_window_state.fun;
+                    if process_window_state(window_state, event_handler) {
+                        return;
+                    }
+                    let looph = &r_window_state.loop_handle;
+                    for token in window_state.to_remove_tokens.iter() {
+                        looph.remove(*token);
+                    }
+                    window_state.to_remove_tokens.clear();
+                    if let Some(VirtualKeyRelease { delay, time, key }) =
+                        window_state.to_be_released_key
+                    {
+                        looph
+                            .insert_source(
+                                Timer::from_duration(delay),
+                                move |_, _, r_window_state| {
+                                    let state = &mut r_window_state.raw;
+                                    let ky = state.get_virtual_keyboard().unwrap();
+
+                                    ky.key(time, key, KeyState::Released.into());
+                                    TimeoutAction::Drop
+                                },
+                            )
+                            .ok();
+                    }
+                    if let Some(KeyboardTokenState {
+                        key,
+                        delay,
+                        surface_id,
+                        pressed_state,
+                    }) = window_state.repeat_delay.take()
+                    {
+                        let timer = Timer::from_duration(delay);
+                        let keyboard_state = window_state.keyboard_state.as_mut().unwrap();
+                        keyboard_state.repeat_token = looph
+                            .insert_source(timer, move |_, _, r_window_state| {
+                                let state = &mut r_window_state.raw;
+                                let event_handler = &mut r_window_state.fun;
+                                let keyboard_state = match state.keyboard_state.as_mut() {
+                                    Some(keyboard_state) => keyboard_state,
+                                    None => return TimeoutAction::Drop,
+                                };
+                                let repeat_keycode = match keyboard_state.current_repeat {
+                                    Some(repeat_keycode) => repeat_keycode,
+                                    None => return TimeoutAction::Drop,
+                                };
+                                // NOTE: not the same key
+                                if repeat_keycode != key {
+                                    return TimeoutAction::Drop;
+                                }
+                                if let Some(mut key_context) =
+                                    keyboard_state.xkb_context.key_context()
+                                {
+                                    let event = key_context.process_key_event(
+                                        repeat_keycode,
+                                        pressed_state,
+                                        false,
+                                    );
+                                    let event = DispatchMessageInner::KeyboardInput {
+                                        event,
+                                        is_synthetic: false,
+                                    };
+                                    state.message.push((surface_id, event));
+                                }
+                                let repeat_info = keyboard_state.repeat_info;
+
+                                let _ = keyboard_state;
+                                state.handle_event(
+                                    &mut *event_handler,
+                                    LayerShellEvent::NormalDispatch,
+                                    None,
+                                );
+                                match repeat_info {
+                                    RepeatInfo::Repeat { gap, .. } => {
+                                        TimeoutAction::ToDuration(gap)
+                                    }
+                                    RepeatInfo::Disable => TimeoutAction::Drop,
+                                }
+                            })
+                            .ok();
+                    }
                 },
             )
             .expect("Error during event loop!");
-        to_exit.store(true, Ordering::Relaxed);
-        let _ = thread.join();
         Ok(())
     }
 

@@ -1,4 +1,3 @@
-mod state;
 use crate::{
     DefaultStyle,
     actions::{IcedNewPopupSettings, LayershellCustomActionWithId, MenuDirection},
@@ -6,6 +5,36 @@ use crate::{
     multi_window::window_manager::WindowManager,
     settings::VirtualKeyboardSettings,
     user_interface::UserInterfaces,
+};
+use crate::{
+    actions::LayershellCustomAction, clipboard::LayerShellClipboard, conversion, error::Error,
+};
+use crate::{
+    event::{IcedLayerShellEvent, WindowEvent as LayerShellWindowEvent},
+    proxy::IcedProxy,
+    settings::Settings,
+};
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
+#[cfg(not(all(feature = "linux-theme-detection", target_os = "linux")))]
+use iced_core::theme::Mode;
+use iced_core::{
+    Event as IcedEvent, theme,
+    window::{Event as IcedWindowEvent, Id as IcedId, RedrawRequest},
+};
+use iced_core::{Size, mouse::Cursor, time::Instant};
+use iced_futures::{Executor, Runtime};
+use iced_graphics::{Compositor, Shell, compositor};
+use iced_program::Instance;
+use iced_program::Program as IcedProgram;
+use iced_runtime::Action;
+use iced_runtime::user_interface;
+use layershellev::{
+    LayerShellEvent, NewPopUpSettings, RefreshRequest, ReturnData, WindowState, WindowWrapper,
+    id::Id as LayerShellId,
+    reexport::{
+        wayland_client::{WlCompositor, WlRegion},
+        zwp_virtual_keyboard_v1,
+    },
 };
 use std::{
     borrow::Cow,
@@ -16,50 +45,12 @@ use std::{
     task::Poll,
     time::Duration,
 };
-
-use crate::{
-    actions::LayershellCustomAction, clipboard::LayerShellClipboard, conversion, error::Error,
-};
-
-use iced::{
-    Event as IcedEvent, theme,
-    window::{Event as IcedWindowEvent, Id as IcedId, RedrawRequest},
-};
-use iced_graphics::{Compositor, compositor};
-use iced_runtime::Action;
-
-use iced_runtime::debug;
-
-use iced_core::{Size, mouse::Cursor, time::Instant};
-use iced_runtime::user_interface;
-
-use iced_futures::{Executor, Runtime};
-
-use layershellev::{
-    LayerShellEvent, NewPopUpSettings, RefreshRequest, ReturnData, WindowState, WindowWrapper,
-    calloop::timer::{TimeoutAction, Timer},
-    id::Id as LayerShellId,
-    reexport::{
-        wayland_client::{WlCompositor, WlRegion},
-        zwp_virtual_keyboard_v1,
-    },
-};
-
-use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use window_manager::Window;
 
-use crate::{
-    event::{IcedLayerShellEvent, WindowEvent as LayerShellWindowEvent},
-    proxy::IcedProxy,
-    settings::Settings,
-};
-
+mod state;
 mod window_manager;
 
 type MultiRuntime<E, Message> = Runtime<E, IcedProxy<Action<Message>>, Action<Message>>;
-
-use iced_program::Instance;
-use iced_program::Program as IcedProgram;
 
 // a dispatch loop, another is listen loop
 pub fn run<P>(
@@ -74,20 +65,22 @@ where
     P::Message: 'static + TryInto<LayershellCustomActionWithId, Error = P::Message>,
 {
     use futures::task;
-    let (message_sender, message_receiver) = std::sync::mpsc::channel::<Action<P::Message>>();
+    use layershellev::calloop::channel::channel;
+    let (message_sender, message_receiver) = channel::<Action<P::Message>>();
 
-    let boot_span = debug::boot();
+    let boot_span = iced_debug::boot();
     let proxy = IcedProxy::new(message_sender);
 
     #[cfg(feature = "debug")]
     {
         let proxy = proxy.clone();
 
-        debug::on_hotpatch(move || {
+        iced_debug::on_hotpatch(move || {
             proxy.send_action(Action::Reload);
         });
     }
 
+    let proxy_back = proxy.clone();
     let mut runtime: MultiRuntime<P::Executor, P::Message> = {
         let executor = P::Executor::new().map_err(Error::ExecutorCreationFailed)?;
 
@@ -104,7 +97,7 @@ where
         runtime.enter(|| application.subscription().map(Action::Output)),
     ));
 
-    let ev: WindowState<iced::window::Id> = layershellev::WindowState::new(namespace)
+    let ev: WindowState<iced_core::window::Id> = layershellev::WindowState::new(namespace)
         .with_start_mode(settings.layer_settings.start_mode)
         .with_use_display_handle(true)
         .with_events_transparent(settings.layer_settings.events_transparent)
@@ -118,6 +111,7 @@ where
         .build()
         .expect("Cannot create layershell");
 
+    #[cfg(all(feature = "linux-theme-detection", target_os = "linux"))]
     let system_theme = {
         let to_mode = |color_scheme| match color_scheme {
             mundy::ColorScheme::NoPreference => theme::Mode::None,
@@ -135,17 +129,23 @@ where
                 .boxed(),
         );
 
-        mundy::Preferences::once_blocking(
-            mundy::Interest::ColorScheme,
-            core::time::Duration::from_millis(200),
-        )
-        .map(|preferences| to_mode(preferences.color_scheme))
-        .unwrap_or_default()
+        runtime
+            .enter(|| {
+                mundy::Preferences::once_blocking(
+                    mundy::Interest::ColorScheme,
+                    core::time::Duration::from_millis(200),
+                )
+            })
+            .map(|preferences| to_mode(preferences.color_scheme))
+            .unwrap_or_default()
     };
+
+    #[cfg(not(all(feature = "linux-theme-detection", target_os = "linux")))]
+    let system_theme = Mode::default();
 
     let context = Context::<
         P,
-        <P as iced::Program>::Executor,
+        <P as iced_program::Program>::Executor,
         <P::Renderer as iced_graphics::compositor::Default>::Compositor,
     >::new(
         application,
@@ -153,6 +153,7 @@ where
         runtime,
         settings.fonts,
         system_theme,
+        proxy_back,
     );
     let mut context_state = ContextState::Context(context);
     boot_span.finish();
@@ -269,7 +270,7 @@ where
 {
     compositor_settings: iced_graphics::Settings,
     runtime: MultiRuntime<E, P::Message>,
-    system_theme: iced::theme::Mode,
+    system_theme: iced_core::theme::Mode,
     fonts: Vec<Cow<'static, [u8]>>,
     compositor: Option<C>,
     window_manager: WindowManager<P, C>,
@@ -280,6 +281,7 @@ where
     waiting_layer_shell_actions: Vec<(Option<IcedId>, LayershellCustomAction)>,
     iced_events: Vec<(IcedId, IcedEvent)>,
     messages: Vec<P::Message>,
+    proxy: IcedProxy<Action<P::Message>>,
 }
 
 impl<P, E, C> Context<P, E, C>
@@ -295,7 +297,8 @@ where
         compositor_settings: iced_graphics::Settings,
         runtime: MultiRuntime<E, P::Message>,
         fonts: Vec<Cow<'static, [u8]>>,
-        system_theme: iced::theme::Mode,
+        system_theme: iced_core::theme::Mode,
+        proxy: IcedProxy<Action<P::Message>>,
     ) -> Self {
         Self {
             compositor_settings,
@@ -311,13 +314,20 @@ where
             waiting_layer_shell_actions: Default::default(),
             iced_events: Default::default(),
             messages: Default::default(),
+            proxy,
         }
     }
 
     async fn create_compositor(mut self, window: Arc<WindowWrapper>) -> Self {
-        let mut new_compositor = C::new(self.compositor_settings, window.clone())
-            .await
-            .expect("Cannot create compositer");
+        let shell = Shell::new(self.proxy.clone());
+        let mut new_compositor = C::new(
+            self.compositor_settings,
+            window.clone(),
+            window.clone(),
+            shell,
+        )
+        .await
+        .expect("Cannot create compositer");
         for font in self.fonts.clone() {
             new_compositor.load_font(font);
         }
@@ -412,12 +422,15 @@ where
                 || window_size.height != height
                 || window.state.wayland_scale_factor() != scale_float
             {
-                let layout_span = debug::layout(iced_id);
+                let layout_span = iced_debug::layout(iced_id);
                 window.state.update_view_port(width, height, scale_float);
                 if let Some(ui) = self.user_interfaces.ui_mut(&iced_id) {
                     ui.relayout(window.state.viewport().logical_size(), &mut window.renderer);
                 }
                 layout_span.finish();
+                events.push(IcedEvent::Window(IcedWindowEvent::Resized(
+                    window.state.window_size_f32(),
+                )));
             }
             (iced_id, window)
         } else {
@@ -473,7 +486,7 @@ where
             Instant::now(),
         )));
 
-        let draw_span = debug::draw(iced_id);
+        let draw_span = iced_debug::draw(iced_id);
         let (ui_state, statuses) = ui.update(
             &events,
             cursor,
@@ -533,7 +546,7 @@ where
 
         window.draw_preedit();
 
-        let present_span = debug::present(iced_id);
+        let present_span = iced_debug::present(iced_id);
         match compositor.present(
             &mut window.renderer,
             &mut window.surface,
@@ -723,18 +736,11 @@ where
                 use layershellev::reexport::wayland_client::KeyState;
                 let ky = ev.get_virtual_keyboard().unwrap();
                 ky.key(time, key, KeyState::Pressed.into());
-
-                let eh = ev.get_loop_handler().unwrap();
-                eh.insert_source(
-                    Timer::from_duration(Duration::from_micros(100)),
-                    move |_, _, state| {
-                        let ky = state.get_virtual_keyboard().unwrap();
-
-                        ky.key(time, key, KeyState::Released.into());
-                        TimeoutAction::Drop
-                    },
-                )
-                .ok();
+                ev.set_virtual_key_release(layershellev::VirtualKeyRelease {
+                    delay: Duration::from_micros(100),
+                    time,
+                    key,
+                });
             }
             LayershellCustomAction::NewLayerShell {
                 settings,
@@ -840,7 +846,7 @@ where
 
         let mut rebuilds = Vec::new();
         for (iced_id, window) in self.window_manager.iter_mut() {
-            let interact_span = debug::interact(iced_id);
+            let interact_span = iced_debug::interact(iced_id);
             let mut window_events = vec![];
 
             self.iced_events.retain(|(window_id, event)| {
@@ -897,7 +903,7 @@ where
             for (_, window) in self.window_manager.iter_mut() {
                 window.state.synchronize(application);
             }
-            debug::theme_changed(|| {
+            iced_debug::theme_changed(|| {
                 self.window_manager
                     .first()
                     .and_then(|window| theme::Base::palette(window.state.theme()))
@@ -941,6 +947,7 @@ where
                 redraw_request,
                 input_method,
                 mouse_interaction,
+                ..
             } => {
                 if unconditional_rendering {
                     ev.request_refresh(window.id, RefreshRequest::NextFrame);
@@ -965,9 +972,9 @@ where
                             }
                         }
                         iced_core::InputMethod::Enabled {
-                            position,
                             purpose,
                             preedit: _,
+                            cursor,
                         } => {
                             if ime_flags.contains(ImeState::Allowed) {
                                 ev.set_ime_allowed(true);
@@ -976,10 +983,10 @@ where
                             if ime_flags.contains(ImeState::Update) {
                                 ev.set_ime_purpose(conversion::ime_purpose(purpose));
                                 ev.set_ime_cursor_area(
-                                    layershellev::dpi::LogicalPosition::new(position.x, position.y),
+                                    layershellev::dpi::LogicalPosition::new(cursor.x, cursor.y),
                                     layershellev::dpi::LogicalSize {
-                                        width: 10,
-                                        height: 10,
+                                        width: cursor.width,
+                                        height: cursor.height,
                                     },
                                     window.id,
                                 );
@@ -1023,7 +1030,7 @@ pub(crate) fn update<P: IcedProgram, E: Executor>(
     let subscription = runtime.enter(|| application.subscription());
     let recipes = iced_futures::subscription::into_recipes(subscription.map(Action::Output));
 
-    debug::subscriptions_tracked(recipes.len());
+    iced_debug::subscriptions_tracked(recipes.len());
     runtime.track(recipes);
 }
 
@@ -1034,10 +1041,10 @@ pub(crate) fn run_action<P, C, E: Executor>(
     event: Action<P::Message>,
     messages: &mut Vec<P::Message>,
     clipboard: &mut LayerShellClipboard,
-    waiting_layer_shell_actions: &mut Vec<(Option<iced::window::Id>, LayershellCustomAction)>,
+    waiting_layer_shell_actions: &mut Vec<(Option<iced_core::window::Id>, LayershellCustomAction)>,
     should_exit: &mut bool,
     window_manager: &mut WindowManager<P, C>,
-    system_theme: &mut iced::theme::Mode,
+    system_theme: &mut iced_core::theme::Mode,
     runtime: &mut MultiRuntime<E, P::Message>,
     ev: &mut WindowState<IcedId>,
 ) where
@@ -1061,7 +1068,18 @@ pub(crate) fn run_action<P, C, E: Executor>(
                 messages.push(stream);
             }
         },
+        Action::Image(action) => match action {
+            iced_runtime::image::Action::Allocate(handle, sender) => {
+                use iced_core::Renderer as _;
 
+                // TODO: Shared image cache in compositor
+                if let Some((_id, window)) = window_manager.iter_mut().next() {
+                    window.renderer.allocate_image(&handle, move |allocation| {
+                        let _ = sender.send(allocation);
+                    });
+                }
+            }
+        },
         Action::Clipboard(action) => match action {
             clipboard::Action::Read { target, channel } => {
                 let _ = channel.send(clipboard.read(target));
